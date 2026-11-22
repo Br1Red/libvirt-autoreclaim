@@ -33,8 +33,11 @@ identified guests, it reads `MemTotal`, `MemAvailable`, `AnonPages`,
 `guest-file-read` of the guest's `/proc/meminfo` per poll when the VM has a
 QEMU Guest Agent channel. The XML must define the
 `org.qemu.guest_agent.0` Unix channel and the agent must be running and
-reachable. With a valid guest sample, the daemon uses `MemTotal` for balloon
-guests without querying balloon statistics. If the agent times out or cannot
+reachable. With a valid guest sample, balloon guests use libvirt's
+`memoryStats()['actual']` for allocated RAM and the Guest Agent's `MemAvailable`
+for usable RAM. Guest `MemTotal` does not track balloon inflation and must not
+be used to confirm resize targets. Missing hypervisor allocation skips the
+sample rather than substituting `MemTotal`. If the agent times out or cannot
 read meminfo, it falls back to fresh balloon statistics when available. Each
 agent command has a one-second timeout.
 
@@ -192,6 +195,13 @@ second are still distinct. Guest
 `/proc/pressure/memory` is read only after a successful Guest Agent meminfo
 read, when available memory is below twice the effective reserve or the PD
 controller computes a negative correction.
+If the guest reports that `/proc/pressure/memory` does not exist (for example,
+when its kernel does not expose PSI), the daemon logs one warning per VM and
+skips further PSI reads until that VM or the daemon restarts. Meminfo sampling
+and reclaim continue without the optional PSI signal; transient Guest Agent
+errors do not disable subsequent PSI reads.
+Guest Agent libvirt error messages include the domain name, including calls
+made by parallel sampling workers.
 
 Guest Agent memory reads use one persistent pool sized by `general.agent_workers`
 (four workers by default), with at most

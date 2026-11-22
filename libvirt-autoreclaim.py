@@ -12,6 +12,7 @@ import signal
 import xml.etree.ElementTree as ET
 import libvirt
 from concurrent.futures import ThreadPoolExecutor, wait
+from contextvars import ContextVar
 
 from time import monotonic, sleep, time
 from typing import NamedTuple, Optional
@@ -29,6 +30,9 @@ GUEST_OS_RETRY_INTERVAL = 60
 WINDOWS_STATUS_TIMEOUT = 5
 # Some QGA versions print PRId64 literally instead of the PID.
 GUEST_EXEC_PID_NOT_FOUND_PATTERN = re.compile(r"\bPID (?:-?\d+|lld|ld|I64d) does not exist$")
+GUEST_PSI_NOT_FOUND_PATTERN = re.compile(
+    r"failed to open file '/proc/pressure/memory' \(mode: 'r'\): No such file or directory$")
+LIBVIRT_ERROR_DOMAIN = ContextVar("libvirt_error_domain", default=None)
 WINDOWS_MEMORY_COMMAND = (
     "$ErrorActionPreference='Stop'; "
     "$os=Get-CimInstance Win32_OperatingSystem; "
@@ -106,6 +110,14 @@ def cleanup_libvirt(operation, *args):
     except libvirt.libvirtError as error:
         logging.debug("Libvirt cleanup failed: %s", error)
 
+def guest_agent_rpc(dom, command):
+    import libvirt_qemu
+    token = LIBVIRT_ERROR_DOMAIN.set(dom.name())
+    try:
+        return libvirt_qemu.qemuAgentCommand(dom, command, 1, 0)
+    finally:
+        LIBVIRT_ERROR_DOMAIN.reset(token)
+
 class LogFormatter(logging.Formatter):
     def formatMessage(self, record):
         if record.levelno == logging.INFO:
@@ -134,6 +146,7 @@ class LibVirtAutoReclaim:
         self.guest_os = {}
         self.guest_os_retry_at = {}
         self.windows_agent_state = {}
+        self.guest_psi_unavailable = set()
         self.windows_exec_enabled = False
         self.stats_periods = {}
         self.last_poll_times = {}
@@ -274,12 +287,11 @@ class LibVirtAutoReclaim:
         return self.config.get("default", {})
 
     def __guest_agent_command(self, dom, command, arguments=None):
-        import libvirt_qemu
         request = {"execute": command}
         if arguments is not None:
             request["arguments"] = arguments
         try:
-            raw_response = libvirt_qemu.qemuAgentCommand(dom, json.dumps(request), 1, 0)
+            raw_response = guest_agent_rpc(dom, json.dumps(request))
         except libvirt.libvirtError as error:
             get_error_code = getattr(error, "get_error_code", None)
             command_failed = getattr(libvirt, "VIR_ERR_AGENT_COMMAND_FAILED", None)
@@ -417,20 +429,27 @@ class LibVirtAutoReclaim:
 
     def _read_guest_agent_file(self, dom, path):
         name = dom.name()
+        if path == "/proc/pressure/memory" and name in self.guest_psi_unavailable:
+            return None
         handle = None
         try:
-            import libvirt_qemu
             command = json.dumps({
                 "execute": "guest-file-open",
                 "arguments": {"path": path, "mode": "r"},
             })
-            handle = json.loads(libvirt_qemu.qemuAgentCommand(dom, command, 1, 0))["return"]
+            response = json.loads(guest_agent_rpc(dom, command))
+            if isinstance(response, dict) and "error" in response:
+                agent_error = response["error"]
+                if isinstance(agent_error, dict) and isinstance(agent_error.get("desc"), str):
+                    raise ValueError(agent_error["desc"])
+                raise ValueError("guest-file-open failed: {}".format(agent_error))
+            handle = response["return"]
             count = 16384
             command = json.dumps({
                 "execute": "guest-file-read",
                 "arguments": {"handle": handle, "count": count},
             })
-            result = json.loads(libvirt_qemu.qemuAgentCommand(dom, command, 1, 0))["return"]
+            result = json.loads(guest_agent_rpc(dom, command))["return"]
             encoded = result.get("buf-b64", "") if isinstance(result, dict) else None
             if not isinstance(encoded, str):
                 raise ValueError("invalid guest-file-read response")
@@ -439,7 +458,14 @@ class LibVirtAutoReclaim:
                 raise ValueError("truncated procfs read")
             return data.decode("utf-8")
         except (ImportError, libvirt.libvirtError, KeyError, ValueError) as error:
-            logging.debug("%s guest-agent read of %s failed: %s", name, path, error)
+            if (path == "/proc/pressure/memory" and handle is None
+                    and GUEST_PSI_NOT_FOUND_PATTERN.search(str(error))):
+                self.guest_psi_unavailable.add(name)
+                logging.log(self.agent_error_level,
+                            "%s guest memory PSI unavailable; skipping PSI reads until restart: %s",
+                            name, error)
+            else:
+                logging.debug("%s guest-agent read of %s failed: %s", name, path, error)
         finally:
             if handle is not None:
                 try:
@@ -447,7 +473,7 @@ class LibVirtAutoReclaim:
                         "execute": "guest-file-close",
                         "arguments": {"handle": handle},
                     })
-                    libvirt_qemu.qemuAgentCommand(dom, command, 1, 0)
+                    guest_agent_rpc(dom, command)
                 except (ImportError, libvirt.libvirtError) as error:
                     logging.debug("%s guest-agent close of %s failed: %s", name, path, error)
         return None
@@ -522,14 +548,16 @@ class LibVirtAutoReclaim:
             if vmem_info is not None:
                 allocated_actual = vmem_info["base_ram_kb"] + vmem_info["total_current_kb"]
         if guest_stats is not None:
-            if backend.get("os") == "windows" and allocated_actual is None:
+            if (allocated_actual is None
+                    and (backend.get("type", "balloon") == "balloon"
+                         or backend.get("os") == "windows")):
                 try:
                     allocated_actual = dom.memoryStats().get("actual", 0)
                 except libvirt.libvirtError as error:
-                    logging.warning("%s cannot read Windows hypervisor memory allocation: %s", name, error)
+                    logging.warning("%s cannot read hypervisor memory allocation: %s", name, error)
                     return {}
                 if allocated_actual <= 0:
-                    logging.warning("%s Windows hypervisor memory allocation is missing", name)
+                    logging.warning("%s hypervisor memory allocation is missing", name)
                     return {}
             if allocated_actual is None:
                 return guest_stats
@@ -1006,10 +1034,15 @@ class LibVirtAutoReclaim:
                 sampled_domains.append((yield_score, dom, memstat))
         pressure = self.host_memory_pressure() if sampled_domains else 0.0
         for _, dom, memstat in sorted(sampled_domains, key=lambda entry: entry[0], reverse=True):
+            name = None
             try:
+                name = dom.name()
                 self.process_domainID(dom, pressure, memstat)
             except libvirt.libvirtError as error:
-                logging.warning("Domain stopped or unavailable, skipping: %s", error)
+                if name is None:
+                    logging.warning("Domain name unavailable, skipping: %s", error)
+                else:
+                    logging.warning("%s stopped or unavailable, skipping: %s", name, error)
         self.__update_poll_interval()
 
     def dom_print_names(self):
@@ -1064,6 +1097,7 @@ class LibVirtAutoReclaim:
         self.pending_targets.pop(name, None)
         self.manual_increase_until.pop(name, None)
         self.control_samples.pop(name, None)
+        self.guest_psi_unavailable.discard(name)
 
     def __refresh_domain(self, dom):
         name = dom.name()
@@ -1175,20 +1209,23 @@ class LibVirtAutoReclaim:
         return True
 
     def __domain_lifecycle(self, conn, dom, event, detail, opaque):
+        name = None
         try:
+            name = dom.name()
             if event in (libvirt.VIR_DOMAIN_EVENT_STOPPED, libvirt.VIR_DOMAIN_EVENT_CRASHED):
-                self.guest_os.pop(dom.name(), None)
-                self.guest_os_retry_at.pop(dom.name(), None)
-                self.windows_agent_state.pop(dom.name(), None)
-                self.__forget_domain(dom.name())
+                self.guest_os.pop(name, None)
+                self.guest_os_retry_at.pop(name, None)
+                self.windows_agent_state.pop(name, None)
+                self.__forget_domain(name)
             elif event == libvirt.VIR_DOMAIN_EVENT_STARTED:
+                self.guest_psi_unavailable.discard(name)
                 # A preceding refresh may already have scheduled an OS retry.
-                if self.guest_os.get(dom.name()) is not None:
-                    self.guest_os.pop(dom.name(), None)
-                    self.guest_os_retry_at.pop(dom.name(), None)
-                self.windows_agent_state.pop(dom.name(), None)
-                self.control_samples.pop(dom.name(), None)
-                self.last_poll_times.pop(dom.name(), None)
+                if self.guest_os.get(name) is not None:
+                    self.guest_os.pop(name, None)
+                    self.guest_os_retry_at.pop(name, None)
+                self.windows_agent_state.pop(name, None)
+                self.control_samples.pop(name, None)
+                self.last_poll_times.pop(name, None)
                 try:
                     self.__load_config()
                 except (OSError, ValueError, ExitFailure) as error:
@@ -1199,18 +1236,23 @@ class LibVirtAutoReclaim:
                     self.dom_print_names()
             elif event in (libvirt.VIR_DOMAIN_EVENT_DEFINED,
                            libvirt.VIR_DOMAIN_EVENT_RESUMED):
-                self.control_samples.pop(dom.name(), None)
+                self.control_samples.pop(name, None)
                 if event == libvirt.VIR_DOMAIN_EVENT_RESUMED:
-                    self.last_poll_times.pop(dom.name(), None)
+                    self.last_poll_times.pop(name, None)
                 self.__refresh_domain(dom)
             elif event == libvirt.VIR_DOMAIN_EVENT_UNDEFINED:
                 if dom.ID() >= 0:
                     self.__refresh_domain(dom)
                 else:
-                    self.__forget_domain(dom.name())
+                    self.__forget_domain(name)
             self.__update_poll_interval()
         except libvirt.libvirtError as error:
-            logging.warning("Cannot update domain monitoring after lifecycle event: %s", error)
+            if name is None:
+                logging.warning("Cannot update domain monitoring after lifecycle event "
+                                "(domain name unavailable): %s", error)
+            else:
+                logging.warning("%s cannot update domain monitoring after lifecycle event: %s",
+                                name, error)
 
     def __memory_device_size_change(self, conn, dom, alias, size, opaque):
         name = dom.name()
@@ -1443,11 +1485,16 @@ def report_libvirt_error(context, error):
             or (code == getattr(libvirt, "VIR_ERR_AGENT_COMMAND_FAILED", None)
                 and (context == "status"
                      or (isinstance(message, str)
-                         and GUEST_EXEC_PID_NOT_FOUND_PATTERN.search(message))))):
+                         and (GUEST_EXEC_PID_NOT_FOUND_PATTERN.search(message)
+                              or GUEST_PSI_NOT_FOUND_PATTERN.search(message)))))):
         # Domain and guest-agent callers already report the handled exception.
         return
     log = logging.warning if level == libvirt.VIR_ERR_WARNING else logging.error
-    log("libvirt: %s", message)
+    name = LIBVIRT_ERROR_DOMAIN.get()
+    if name is not None:
+        log("libvirt: %s: %s", name, message)
+    else:
+        log("libvirt: %s", message)
 
 def libvirt_autoreclaim(argv):
     parser = argparse.ArgumentParser(prog="libvirt-autoreclaim")

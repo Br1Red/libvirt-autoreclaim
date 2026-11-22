@@ -164,6 +164,7 @@ class AdaptiveControllerTests(unittest.TestCase):
         self.controller.stats_periods = {"guest-a": 2}
         self.controller.last_poll_times = {}
         self.controller.windows_agent_state = {}
+        self.controller.guest_psi_unavailable = set()
         self.controller.windows_exec_enabled = True
         self.controller.poll_interval = 2
         self.controller.polling_active = True
@@ -408,6 +409,54 @@ class AdaptiveControllerTests(unittest.TestCase):
             "swap_free": 150000,
         })
         self.assertEqual(commands, ["guest-file-open", "guest-file-read", "guest-file-close"])
+
+    def test_missing_guest_psi_is_reported_once_and_skipped_per_domain(self):
+        message = ("failed to open file '/proc/pressure/memory' (mode: 'r'): "
+                   "No such file or directory")
+        for raw_response in (False, True):
+            with self.subTest(raw_response=raw_response):
+                self.controller.guest_psi_unavailable.clear()
+                agent = Mock()
+                if raw_response:
+                    agent.return_value = json.dumps({
+                        "error": {"class": "GenericError", "desc": message}})
+                else:
+                    agent.side_effect = autoreclaim.libvirt.libvirtError(
+                        "unable to execute QEMU agent command 'guest-file-open': " + message)
+                with patch.dict(sys.modules, {
+                        "libvirt_qemu": types.SimpleNamespace(qemuAgentCommand=agent)}), \
+                        self.assertLogs(level="WARNING") as logs:
+                    for _ in range(3):
+                        self.assertEqual(self.controller._get_guest_agent_memory_pressure(
+                            self.domain), (None, None))
+                    self.assertEqual(agent.call_count, 1)
+                    self.assertEqual(len(logs.output), 1)
+                    self.assertIn("guest-a", logs.output[0])
+                    self.assertIn("until restart", logs.output[0])
+                    other = Domain("guest-b")
+                    self.assertEqual(self.controller._get_guest_agent_memory_pressure(
+                        other), (None, None))
+                    self.assertEqual(agent.call_count, 2)
+                    self.controller._get_guest_agent_meminfo(self.domain)
+                    self.assertEqual(agent.call_count, 3)
+                self.assertEqual(self.controller.guest_psi_unavailable, {"guest-a", "guest-b"})
+
+    def test_transient_guest_psi_failure_does_not_disable_future_samples(self):
+        agent = Mock(side_effect=[
+            autoreclaim.libvirt.libvirtError("guest agent timed out"),
+            '{"return": 7}',
+            json.dumps({"return": {"buf-b64": base64.b64encode(
+                b"some avg10=0.40\nfull avg10=0.01\n").decode(), "eof": True}}),
+            '{"return": {}}',
+        ])
+        with patch.dict(sys.modules, {
+                "libvirt_qemu": types.SimpleNamespace(qemuAgentCommand=agent)}):
+            self.assertEqual(self.controller._get_guest_agent_memory_pressure(
+                self.domain), (None, None))
+            self.assertEqual(self.controller._get_guest_agent_memory_pressure(
+                self.domain), (0.4, 0.01))
+        self.assertEqual(self.controller.guest_psi_unavailable, set())
+        self.assertEqual(agent.call_count, 4)
 
     def test_windows_agent_collects_async_metrics_without_linux_procfs(self):
         self.controller.vm_backends["guest-a"] = {
@@ -732,20 +781,26 @@ class AdaptiveControllerTests(unittest.TestCase):
                 else:
                     self.assertLess(self.domain.calls[0], 4194304)
 
-    def test_windows_uses_hypervisor_allocation_not_visible_ram_for_pending_targets(self):
-        self.controller.vm_backends["guest-a"] = {
-            "type": "balloon", "os": "windows", "has_guest_agent": True}
+    def test_balloon_uses_hypervisor_allocation_not_visible_ram_for_pending_targets(self):
         self.domain.memory = self.domain.maximum = 8388608
         guest_stats = {"actual": 8319404, "usable": 100000, "source": "guest-agent",
                        "last_update": self.now, "sampled_at": self.now, "pages_per_sec": 5862}
-        self.controller.pending_targets["guest-a"] = (8388608, self.now - 10)
-        stats = self.controller._get_domain_memstats(
-            self.domain, guest_stats=guest_stats, query_guest=False)
-        self.assertEqual(stats["actual"], 8388608)
-        self.assertEqual(stats["usable"], 100000)
-        self.controller.process_domainID(self.domain, 1, stats)
-        self.assertNotIn("guest-a", self.controller.pending_targets)
-        self.assertEqual(self.domain.calls, [])
+        for guest_os in ("windows", "other"):
+            with self.subTest(guest_os=guest_os):
+                self.controller.vm_backends["guest-a"] = {
+                    "type": "balloon", "os": guest_os, "has_guest_agent": True}
+                self.controller.control_samples.clear()
+                self.controller.memory_targets.clear()
+                self.controller.pending_targets["guest-a"] = (8388608, self.now - 10)
+                stats = self.controller._get_domain_memstats(
+                    self.domain, guest_stats=guest_stats, query_guest=False)
+                self.assertEqual(stats["actual"], 8388608)
+                self.assertEqual(stats["usable"], 100000)
+                with patch.object(self.controller, "_get_guest_agent_memory_pressure",
+                                  return_value=(None, None)):
+                    self.controller.process_domainID(self.domain, 1, stats)
+                self.assertNotIn("guest-a", self.controller.pending_targets)
+                self.assertEqual(self.domain.calls, [])
 
     def test_switching_statistics_source_does_not_trigger_external_increase_grace(self):
         self.controller.vm_backends["guest-a"] = {"type": "balloon", "os": "windows"}
@@ -765,14 +820,16 @@ class AdaptiveControllerTests(unittest.TestCase):
                 self.assertNotIn("guest-a", self.controller.manual_increase_until)
                 self.assertEqual(self.controller.memory_targets["guest-a"], 8388608)
 
-    def test_windows_missing_hypervisor_actual_does_not_use_visible_ram(self):
-        self.controller.vm_backends["guest-a"] = {"type": "balloon", "os": "windows"}
-        with patch.object(self.domain, "memoryStats", return_value={}), \
-                self.assertLogs(level="WARNING"):
-            stats = self.controller._get_domain_memstats(
-                self.domain, guest_stats={"actual": 8319404, "usable": 2000000},
-                query_guest=False)
-        self.assertEqual(stats, {})
+    def test_balloon_missing_hypervisor_actual_does_not_use_visible_ram(self):
+        for guest_os in ("windows", "other"):
+            with self.subTest(guest_os=guest_os):
+                self.controller.vm_backends["guest-a"] = {"type": "balloon", "os": guest_os}
+                with patch.object(self.domain, "memoryStats", return_value={}), \
+                        self.assertLogs(level="WARNING"):
+                    stats = self.controller._get_domain_memstats(
+                        self.domain, guest_stats={"actual": 8319404, "usable": 2000000},
+                        query_guest=False)
+                self.assertEqual(stats, {})
 
     def test_windows_pagefile_growth_uses_existing_swap_protections(self):
         self.controller.vm_backends["guest-a"] = {"type": "balloon", "os": "windows"}
@@ -1065,12 +1122,13 @@ class AdaptiveControllerTests(unittest.TestCase):
             "last_update": self.now,
             "source": "guest-agent",
         }
-        with patch.object(self.domain, "memoryStats") as memory_stats, \
+        with patch.object(self.domain, "memoryStats",
+                          return_value={"actual": self.domain.memory}) as memory_stats, \
                 patch.object(self.controller, "_get_guest_agent_meminfo", return_value=guest_stats), \
                 patch.object(self.controller, "_read_guest_agent_file", return_value=None):
             self.controller.process_domainID(self.domain, 0)
 
-        memory_stats.assert_not_called()
+        memory_stats.assert_called_once_with()
         self.assertGreater(self.domain.memory, 1048576)
 
     def test_virtio_mem_backend_uses_virtio_adjustments_not_balloon(self):
@@ -1209,17 +1267,18 @@ class AdaptiveControllerTests(unittest.TestCase):
         get_stats.assert_called_once_with(self.domain)
         memory_stats.assert_not_called()
 
-    def test_status_uses_guest_agent_without_querying_fresh_balloon_stats(self):
+    def test_status_combines_balloon_allocation_with_fresh_guest_agent_stats(self):
         self.controller.guest_agents.add("guest-a")
         guest_stats = {"actual": 983040, "usable": 393216, "last_update": self.now,
                        "source": "guest-agent"}
         with patch.object(self.controller, "_get_guest_agent_meminfo", return_value=guest_stats), \
                 patch.object(self.controller, "_get_guest_agent_memory_pressure", return_value=(None, None)), \
-                patch.object(self.domain, "memoryStats", wraps=self.domain.memoryStats) as balloon:
+                patch.object(self.domain, "memoryStats", return_value={
+                    "actual": self.domain.memory, "usable": 10, "last_update": 0}) as balloon:
             row = self.controller.dom_status(self.domain)
 
-        balloon.assert_not_called()
-        self.assertEqual(row[:6], ("guest-a", "agent/balloon", "8192", "960", "576", "384"))
+        balloon.assert_called_once_with()
+        self.assertEqual(row[:6], ("guest-a", "agent/balloon", "8192", "1024", "640", "384"))
 
     def test_guest_agent_open_failure_falls_back_to_balloon_without_retrying_psi(self):
         self.controller.guest_agents.add("guest-a")
@@ -2339,6 +2398,71 @@ class LifecycleTests(unittest.TestCase):
                 autoreclaim.report_libvirt_error("start", (code, 10, message, 2))
                 error.assert_called_once_with("libvirt: %s", message)
 
+    def test_libvirt_handler_leaves_missing_guest_psi_reporting_to_caller(self):
+        message = ("unable to execute QEMU agent command 'guest-file-open': "
+                   "failed to open file '/proc/pressure/memory' (mode: 'r'): "
+                   "No such file or directory")
+        with patch.object(autoreclaim.logging, "error") as error:
+            autoreclaim.report_libvirt_error("start", (113, 10, message, 2))
+            error.assert_not_called()
+        for code, text in (
+                (55, message),
+                (113, message.replace("/proc/pressure/memory", "/proc/meminfo")),
+                (113, message.replace("No such file or directory", "Permission denied"))):
+            with self.subTest(code=code, text=text), \
+                    patch.object(autoreclaim.logging, "error") as error:
+                autoreclaim.report_libvirt_error("start", (code, 10, text, 2))
+                error.assert_called_once_with("libvirt: %s", text)
+
+    def test_guest_agent_errors_include_domain_for_each_command_path(self):
+        for command in ("guest-get-osinfo", "guest-file-open", "guest-file-read",
+                        "guest-file-close"):
+            with self.subTest(command=command):
+                def agent(dom, raw, timeout, flags):
+                    execute = json.loads(raw)["execute"]
+                    if execute == command:
+                        autoreclaim.report_libvirt_error(
+                            "start", (113, 10, "guest command failed", 2))
+                        raise self.libvirt.libvirtError("guest command failed")
+                    if execute == "guest-file-open":
+                        return '{"return": 7}'
+                    return '{"return": {"buf-b64": "", "eof": true}}'
+
+                self.qemu_agent.side_effect = agent
+                with patch.object(autoreclaim.logging, "error") as error:
+                    if command == "guest-get-osinfo":
+                        with self.assertRaises(self.libvirt.libvirtError):
+                            self.controller._LibVirtAutoReclaim__guest_agent_command(
+                                self.domain, command)
+                    else:
+                        self.controller._read_guest_agent_file(self.domain, "/proc/meminfo")
+                    error.assert_called_once_with(
+                        "libvirt: %s: %s", "guest-new", "guest command failed")
+                    error.reset_mock()
+                    autoreclaim.report_libvirt_error("start", (55, 10, "connection failed", 2))
+                    error.assert_called_once_with("libvirt: %s", "connection failed")
+
+    def test_parallel_guest_agent_errors_keep_their_own_domain_names(self):
+        barrier = threading.Barrier(2)
+
+        def agent(dom, raw, timeout, flags):
+            barrier.wait(timeout=2)
+            autoreclaim.report_libvirt_error(
+                "start", (113, 10, "failure for " + dom.name(), 2))
+            return '{"return": {}}'
+
+        self.qemu_agent.side_effect = agent
+        with patch.object(autoreclaim.logging, "error") as error, \
+                autoreclaim.ThreadPoolExecutor(max_workers=2) as executor:
+            futures = [executor.submit(autoreclaim.guest_agent_rpc, Domain(name), "{}")
+                       for name in ("guest-a", "guest-b")]
+            for future in futures:
+                future.result()
+        self.assertCountEqual([call.args for call in error.call_args_list], [
+            ("libvirt: %s: %s", "guest-a", "failure for guest-a"),
+            ("libvirt: %s: %s", "guest-b", "failure for guest-b"),
+        ])
+
     def test_new_domains_follow_selection_and_xml_requirements(self):
         for event in (self.libvirt.VIR_DOMAIN_EVENT_DEFINED,
                       self.libvirt.VIR_DOMAIN_EVENT_STARTED,
@@ -2557,14 +2681,18 @@ class LifecycleTests(unittest.TestCase):
                 self.controller.pending_targets["guest-new"] = (1048576, 100)
                 self.controller.manual_increase_until["guest-new"] = 3600
                 self.controller.control_samples["guest-new"] = autoreclaim.MemorySample(1, 1, 1, 100)
+                self.controller.guest_psi_unavailable.add("guest-new")
                 self.lifecycle(event)
                 self.assertNotIn("guest-new", self.controller.monitored_vms)
                 self.assertNotIn("guest-new", self.controller.memory_targets)
                 self.assertNotIn("guest-new", self.controller.pending_targets)
                 self.assertNotIn("guest-new", self.controller.manual_increase_until)
                 self.assertNotIn("guest-new", self.controller.control_samples)
+                self.assertNotIn("guest-new", self.controller.guest_psi_unavailable)
+                self.controller.guest_psi_unavailable.add("guest-new")
                 self.lifecycle(self.libvirt.VIR_DOMAIN_EVENT_STARTED)
                 self.assertIn("guest-new", self.controller.monitored_vms)
+                self.assertNotIn("guest-new", self.controller.guest_psi_unavailable)
 
     def test_undefining_running_guest_preserves_monitoring_and_grace(self):
         self.controller.monitored_vms.add("guest-new")
