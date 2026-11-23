@@ -2554,14 +2554,34 @@ class LifecycleTests(unittest.TestCase):
             self.controller._get_guest_memstats(self.domain)
         self.assertEqual(self.qemu_agent.call_count, 1)
         with patch.object(autoreclaim, "monotonic", return_value=160), \
-                self.assertLogs(level="WARNING"):
+                self.assertNoLogs(level="WARNING"):
             self.controller._get_guest_memstats(self.domain)
         self.assertEqual(self.qemu_agent.call_count, 2)
-        with patch.object(autoreclaim, "monotonic", return_value=161), \
+        with patch.object(autoreclaim, "monotonic", return_value=220), \
+                self.assertNoLogs(level="WARNING"):
+            self.controller._get_guest_memstats(self.domain)
+        self.assertEqual(self.qemu_agent.call_count, 3)
+        with patch.object(autoreclaim, "monotonic", return_value=221), \
                 self.assertLogs(level="WARNING"):
             self.lifecycle(self.libvirt.VIR_DOMAIN_EVENT_STOPPED)
             self.lifecycle(self.libvirt.VIR_DOMAIN_EVENT_STARTED)
-        self.assertEqual(self.qemu_agent.call_count, 3)
+        self.assertEqual(self.qemu_agent.call_count, 4)
+
+    def test_guest_os_warning_is_independent_per_vm(self):
+        other_domain = Mock()
+        other_domain.name.return_value = "guest-other"
+        self.qemu_agent.side_effect = self.libvirt.libvirtError("agent not ready")
+        identify = self.controller._LibVirtAutoReclaim__identify_guest_os
+        with patch.object(autoreclaim, "monotonic", return_value=100), \
+                self.assertLogs(level="WARNING") as logs:
+            identify(self.domain)
+            identify(other_domain)
+        self.assertEqual(len(logs.records), 2)
+        with patch.object(autoreclaim, "monotonic", return_value=160), \
+                self.assertNoLogs(level="WARNING"):
+            identify(self.domain)
+            identify(other_domain)
+        self.assertEqual(self.qemu_agent.call_count, 4)
 
     def test_delayed_guest_agent_is_detected_after_retry_interval(self):
         self.controller.vm_backends["guest-new"] = {

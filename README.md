@@ -23,8 +23,8 @@ virtio-mem device. A balloon device normally defines a stats period from 1 to
 For memory control and `status`, the daemon identifies the guest OS once per
 VM start with QEMU Guest Agent `guest-get-osinfo`. With `--debug`, it logs the
 guest name, detected OS ID and backend OS classification. If identification fails, it
-logs a warning, uses balloon statistics and retries identification every
-60 seconds until the agent responds, allowing for delayed startup in the guest.
+logs a warning once per VM, uses balloon statistics and silently retries identification
+every 60 seconds until the agent responds, allowing for delayed startup in the guest.
 Domain refreshes and the following start event preserve a pending retry to avoid
 duplicate warnings; stopping or crashing the VM clears it.
 Successful identification remains cached until the VM restarts. On other

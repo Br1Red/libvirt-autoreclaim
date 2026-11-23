@@ -327,9 +327,10 @@ class LibVirtAutoReclaim:
                 logging.debug("%s identified guest OS: %s (backend OS: %s)",
                               name, info["id"], self.guest_os[name])
             except (ImportError, libvirt.libvirtError, ValueError) as error:
-                logging.log(self.agent_error_level,
-                            "%s cannot identify guest OS; using balloon statistics and retrying "
-                            "in %s seconds: %s", name, GUEST_OS_RETRY_INTERVAL, error)
+                if name not in self.guest_os:
+                    logging.log(self.agent_error_level,
+                                "%s cannot identify guest OS; using balloon statistics and retrying "
+                                "in %s seconds: %s", name, GUEST_OS_RETRY_INTERVAL, error)
                 self.guest_os[name] = None
                 self.guest_os_retry_at[name] = now + GUEST_OS_RETRY_INTERVAL
         return self.guest_os[name]
