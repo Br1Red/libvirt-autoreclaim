@@ -165,6 +165,7 @@ class AdaptiveControllerTests(unittest.TestCase):
         self.controller.last_poll_times = {}
         self.controller.windows_agent_state = {}
         self.controller.guest_psi_unavailable = set()
+        self.controller.agent_faults = {}
         self.controller.windows_exec_enabled = True
         self.controller.poll_interval = 2
         self.controller.polling_active = True
@@ -507,20 +508,26 @@ class AdaptiveControllerTests(unittest.TestCase):
         self.assertEqual(stats["psi_full"], 0.75)
         self.assertEqual(stats["sampled_at"], 100)
 
-    def test_windows_agent_start_failure_falls_back_without_relaunching(self):
+    def test_windows_agent_start_failure_falls_back_and_retries_after_60_seconds(self):
         self.controller.vm_backends["guest-a"] = {
             "type": "balloon", "has_guest_agent": True, "os": "windows"}
         agent = Mock(side_effect=autoreclaim.libvirt.libvirtError("guest-exec disabled"))
         with patch.dict(sys.modules, {"libvirt_qemu": types.SimpleNamespace(qemuAgentCommand=agent)}), \
                 patch.object(self.controller, "_read_guest_agent_file") as proc, \
-                self.assertLogs(level="WARNING") as logs:
+                self.assertLogs(level="DEBUG") as logs:
             first = self.controller._get_domain_memstats(self.domain)
             self.now += 10
+            self.domain.updated = self.now
             second = self.controller._get_domain_memstats(self.domain)
+            self.now += 60
+            self.domain.updated = self.now
+            third = self.controller._get_domain_memstats(self.domain)
         self.assertEqual(first["source"], "balloon")
         self.assertEqual(second["source"], "balloon")
-        self.assertEqual(agent.call_count, 1)
+        self.assertEqual(third["source"], "balloon")
+        self.assertEqual(agent.call_count, 2)
         self.assertIn("guest-exec disabled", logs.output[0])
+        self.assertEqual(sum(message.startswith("WARNING") for message in logs.output), 1)
         proc.assert_not_called()
 
     def test_windows_agent_start_timeout_retries_after_60_seconds(self):
@@ -528,7 +535,6 @@ class AdaptiveControllerTests(unittest.TestCase):
             "type": "balloon", "has_guest_agent": True, "os": "windows"}
         self.controller.config["default"]["windows_agent_interval"] = 120
         error = autoreclaim.libvirt.libvirtError("guest agent command timed out")
-        error.get_error_code = lambda: 112
         sample = b"1048576|536870912|0|0|0|0|0|0|0|0|0|0"
         agent = Mock(side_effect=[
             error, error, json.dumps({"return": {"pid": 42}}),
@@ -536,8 +542,7 @@ class AdaptiveControllerTests(unittest.TestCase):
                                    "out-data": base64.b64encode(sample).decode()}}),
             json.dumps({"return": {"pid": 43}}),
         ])
-        with patch.object(autoreclaim.libvirt, "VIR_ERR_AGENT_COMMAND_TIMEOUT", 112, create=True), \
-                patch.dict(sys.modules, {"libvirt_qemu": types.SimpleNamespace(qemuAgentCommand=agent)}):
+        with patch.dict(sys.modules, {"libvirt_qemu": types.SimpleNamespace(qemuAgentCommand=agent)}):
             with self.assertLogs(level="WARNING") as logs:
                 self.assertEqual(self.controller._get_domain_memstats(self.domain)["source"], "balloon")
             self.assertIn("retrying in 60 seconds", logs.output[0])
@@ -546,7 +551,7 @@ class AdaptiveControllerTests(unittest.TestCase):
             self.assertIsNone(self.controller._get_windows_status_meminfo(self.domain))
             self.assertEqual(agent.call_count, 1)
             self.now = 160
-            with self.assertLogs(level="WARNING"):
+            with self.assertNoLogs(level="WARNING"):
                 self.assertIsNone(self.controller._get_windows_guest_meminfo(self.domain))
             self.now = 219
             self.assertIsNone(self.controller._get_windows_guest_meminfo(self.domain))
@@ -699,7 +704,7 @@ class AdaptiveControllerTests(unittest.TestCase):
                 self.assertEqual([command["arguments"]["pid"] for command in commands
                                   if command["execute"] == "guest-exec-status"], [42, 43])
 
-    def test_windows_agent_keeps_pid_and_cached_sample_on_transient_status_errors(self):
+    def test_windows_agent_drops_pid_and_schedules_retry_on_transient_status_errors(self):
         for code, message in (
                 (86, "Guest agent not connected"),
                 (112, "Guest agent command timed out"),
@@ -707,6 +712,7 @@ class AdaptiveControllerTests(unittest.TestCase):
                 (86, "PID 42 does not exist")):
             with self.subTest(code=code, message=message):
                 self.now = 100
+                self.controller.agent_faults.clear()
                 cached = {"actual": 1048576, "usable": 524288, "source": "guest-agent",
                           "sampled_at": 90, "last_update": 90}
                 self.controller.windows_agent_state["guest-a"] = {
@@ -720,9 +726,13 @@ class AdaptiveControllerTests(unittest.TestCase):
                         patch.dict(sys.modules, {"libvirt_qemu": types.SimpleNamespace(
                             qemuAgentCommand=agent)}), self.assertLogs(level="WARNING"):
                     self.assertIs(self.controller._get_windows_guest_meminfo(self.domain), cached)
-                self.assertEqual(self.controller.windows_agent_state["guest-a"]["pid"], 42)
-                self.assertEqual(agent.call_count, 1)
-                self.assertEqual(json.loads(agent.call_args.args[1])["execute"], "guest-exec-status")
+                state = self.controller.windows_agent_state["guest-a"]
+                self.assertNotIn("pid", state)
+                self.assertEqual(state["retry_at"], 160)
+                self.assertEqual(agent.call_count, 2)
+                self.assertEqual([json.loads(call.args[1])["execute"]
+                                  for call in agent.call_args_list],
+                                 ["guest-exec-status", "guest-exec"])
 
     def test_windows_agent_rejects_malformed_or_failed_results(self):
         for result in (
@@ -746,6 +756,7 @@ class AdaptiveControllerTests(unittest.TestCase):
             with self.subTest(result=result):
                 self.now = 100
                 self.controller.windows_agent_state.clear()
+                self.controller.agent_faults.clear()
                 self.controller.vm_backends["guest-a"] = {
                     "type": "balloon", "has_guest_agent": True, "os": "windows"}
                 agent = Mock(side_effect=[
@@ -2319,8 +2330,14 @@ class LifecycleTests(unittest.TestCase):
         qemu_patch.start()
         self.addCleanup(qemu_patch.stop)
         self.config_mtime_ns = 0
+        real_stat = autoreclaim.os.stat
 
-        def next_config_stat(path):
+        def next_config_stat(path, *args, **kwargs):
+            # Only fake the configuration file; a blanket mock would make
+            # os.path.exists() report unrelated files (e.g. gettext .mo
+            # translations opened by argparse) as present.
+            if path != "/etc/libvirt/autoreclaim.json":
+                return real_stat(path, *args, **kwargs)
             self.config_mtime_ns += 1
             return Mock(st_mtime_ns=self.config_mtime_ns,
                         st_mtime=float(self.config_mtime_ns))

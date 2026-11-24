@@ -148,21 +148,30 @@ It asynchronously runs PowerShell via QGA `guest-exec` and polls
 `guest-exec-status` no more often than every `windows_agent_interval` seconds
 (10 by default), with at most one
 tracked process in flight per VM to limit PowerShell/CIM overhead. If the
-`guest-exec` start command times out, the daemon retries after 60 seconds at the
-next polling opportunity. It continues using any fresh cached agent sample,
+`guest-exec` start command fails or times out (for example while the guest is
+rebooting and QGA is unavailable), the daemon retries after 60 seconds at the
+next polling opportunity instead of disabling guest-exec until restart. It
+continues using any fresh cached agent sample,
 then falls back to balloon statistics when available. A timed-out command may
 still have started in the guest without returning its PID, so an untracked
-process can overlap a retry. Other start errors remain blocked until VM or
-daemon restart.
+process can overlap a retry.
 
 PowerShell, CIM and the QGA `guest-exec` commands must be enabled in the guest.
-If checking a known PID times out or the agent disconnects, the daemon keeps
-tracking it and retries the status check. If QGA explicitly reports that the
+If checking a known PID fails with a libvirt error (timeout, disconnected or
+unresponsive agent, typically during a guest reboot), the daemon drops the
+pending PID while keeping any cached sample, and immediately attempts a new
+collection, backing off 60 seconds if the start also fails. If QGA explicitly
+reports that the
 PID is no longer registered (`PID ... does not exist`), the daemon discards
 the PID and cached sample, then starts a new collection instead of retrying the
 lost PID indefinitely. This handled condition is logged as a warning without
-a duplicate libvirt error. Other command failures do not invalidate the PID.
+a duplicate libvirt error. Malformed or failed results invalidate the PID
+without touching a previously cached sample.
 Failed or incomplete samples use fresh balloon statistics when available.
+Transient guest-agent failures (OS identification, guest-exec, procfs reads
+and stale statistics) are logged once when they first appear; repeats are
+demoted to debug until the condition clears or the VM restarts, keeping logs
+readable across guest reboots.
 
 Windows agent samples remain valid for `max(30, windows_agent_interval * 3)`
 seconds from process launch (30 by default); Linux and balloon samples retain

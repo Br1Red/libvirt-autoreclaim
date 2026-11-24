@@ -157,6 +157,7 @@ class LibVirtAutoReclaim:
         self.guest_os_retry_at = {}
         self.windows_agent_state = {}
         self.guest_psi_unavailable = set()
+        self.agent_faults = {}  # name -> last_error_category
         self.windows_exec_enabled = False
         self.stats_periods = {}
         self.last_poll_times = {}
@@ -296,6 +297,19 @@ class LibVirtAutoReclaim:
                 return self.__vm_config(vm)
         return self.config.get("default", {})
 
+    def _log_transient_error(self, name, category, level, message, *args):
+        # Log transient guest failures once per streak; repeats go to DEBUG.
+        if self.agent_faults.get(name) != category:
+            self.agent_faults[name] = category
+            logging.log(level, message, *args)
+        else:
+            logging.debug(message, *args)
+
+    def _clear_transient_error(self, name, category=None):
+        if category is None or self.agent_faults.get(name) == category:
+            if self.agent_faults.pop(name, None) is not None:
+                logging.debug("%s transient guest error cleared", name)
+
     def __guest_agent_command(self, dom, command, arguments=None):
         request = {"execute": command}
         if arguments is not None:
@@ -334,13 +348,14 @@ class LibVirtAutoReclaim:
                     raise ValueError("guest OS id is missing")
                 self.guest_os[name] = "windows" if info["id"].lower() == "mswindows" else "other"
                 self.guest_os_retry_at.pop(name, None)
+                self._clear_transient_error(name, "os-info")
                 logging.debug("%s identified guest OS: %s (backend OS: %s)",
                               name, info["id"], self.guest_os[name])
             except (ImportError, libvirt.libvirtError, ValueError) as error:
-                if name not in self.guest_os:
-                    logging.log(self.agent_error_level,
-                                "%s cannot identify guest OS; using balloon statistics and retrying "
-                                "in %s seconds: %s", name, GUEST_OS_RETRY_INTERVAL, error)
+                self._log_transient_error(
+                    name, "os-info", self.agent_error_level,
+                    "%s cannot identify guest OS; using balloon statistics and retrying "
+                    "in %s seconds: %s", name, GUEST_OS_RETRY_INTERVAL, error)
                 self.guest_os[name] = None
                 self.guest_os_retry_at[name] = now + GUEST_OS_RETRY_INTERVAL
         return self.guest_os[name]
@@ -359,7 +374,7 @@ class LibVirtAutoReclaim:
             sample = self._poll_windows_guest_meminfo(dom, single_shot=True)
             if sample is not None:
                 return sample
-            if state.get("pid") is None or state.get("blocked"):
+            if state.get("pid") is None:
                 return None
             remaining = deadline - monotonic()
             if remaining <= 0:
@@ -375,8 +390,7 @@ class LibVirtAutoReclaim:
         windows_sample_max_age = max(30, interval * 3)
         state = self.windows_agent_state.setdefault(name, {"next_check": 0})
         now = monotonic()
-        if (now >= state["next_check"] and now >= state.get("retry_at", 0)
-                and not state.get("blocked")):
+        if now >= state["next_check"] and now >= state.get("retry_at", 0):
             state["next_check"] = now + interval
             pid = state.get("pid")
             if pid is not None:
@@ -415,6 +429,7 @@ class LibVirtAutoReclaim:
                             "last_update": state["started_wall"],
                             "sampled_at": state["started_at"], "source": "guest-agent",
                         }
+                        self._clear_transient_error(name)
                         logging.debug("%s Windows memory: cache=%s KiB protected_cache=%s KiB "
                                       "standby_cache=%s KiB pages/sec=%s pagefile=%s KiB "
                                       "psi_some=%.2f%% psi_full=%.2f%%",
@@ -424,11 +439,18 @@ class LibVirtAutoReclaim:
                 except GuestExecPIDNotFound as error:
                     state.pop("pid")
                     state.pop("sample", None)
-                    logging.log(error_level,
-                                "%s Windows guest-exec PID %s is no longer registered; "
-                                "clearing cached process and sample: %s", name, pid, error)
+                    self._log_transient_error(
+                        name, "win-exec-pid", error_level,
+                        "%s Windows guest-exec PID %s is no longer registered; "
+                        "clearing cached process and sample: %s", name, pid, error)
                 except (ImportError, libvirt.libvirtError, KeyError, TypeError, ValueError) as error:
-                    logging.log(error_level, "%s cannot read Windows guest-exec result: %s", name, error)
+                    # If QGA stops responding (e.g. guest reboot), drop the pending PID
+                    # so polling can relaunch the command once the agent is back.
+                    if isinstance(error, libvirt.libvirtError):
+                        state.pop("pid", None)
+                    self._log_transient_error(
+                        name, "win-exec-status", error_level,
+                        "%s cannot read Windows guest-exec result: %s", name, error)
             if state.get("pid") is None and not (single_shot and "started_at" in state):
                 try:
                     result = self.__guest_agent_command(dom, "guest-exec", {
@@ -442,19 +464,15 @@ class LibVirtAutoReclaim:
                     state.pop("retry_at", None)
                     state.update(pid=result["pid"], started_at=now, started_wall=int(time()))
                 except (ImportError, libvirt.libvirtError, ValueError) as error:
-                    get_error_code = getattr(error, "get_error_code", None)
-                    timeout = getattr(libvirt, "VIR_ERR_AGENT_COMMAND_TIMEOUT", None)
-                    if (isinstance(error, libvirt.libvirtError) and timeout is not None
-                            and callable(get_error_code) and get_error_code() == timeout):
-                        state["retry_at"] = monotonic() + WINDOWS_EXEC_RETRY_INTERVAL
-                        state["next_check"] = state["retry_at"]
-                        logging.log(error_level, "%s cannot start Windows guest-exec; using cached or "
-                                    "balloon statistics and retrying in %s seconds: %s",
-                                    name, WINDOWS_EXEC_RETRY_INTERVAL, error)
-                    else:
-                        state["blocked"] = True
-                        logging.log(error_level, "%s cannot start Windows guest-exec; using balloon "
-                                    "statistics until restart: %s", name, error)
+                    # Transient QGA failures (agent restarting, reboot, timeout) must not
+                    # disable guest-exec permanently; retry after a backoff instead.
+                    state["retry_at"] = monotonic() + WINDOWS_EXEC_RETRY_INTERVAL
+                    state["next_check"] = state["retry_at"]
+                    self._log_transient_error(
+                        name, "win-exec-start", error_level,
+                        "%s cannot start Windows guest-exec; using cached or "
+                        "balloon statistics and retrying in %s seconds: %s",
+                        name, WINDOWS_EXEC_RETRY_INTERVAL, error)
         sample = state.get("sample")
         if sample is not None and 0 <= now - sample["sampled_at"] <= windows_sample_max_age:
             return sample
@@ -489,6 +507,7 @@ class LibVirtAutoReclaim:
             data = base64.b64decode(encoded, validate=True)
             if len(data) >= count and not result.get("eof"):
                 raise ValueError("truncated procfs read")
+            self._clear_transient_error(name, "guest-agent-read")
             return data.decode("utf-8")
         except (ImportError, libvirt.libvirtError, KeyError, ValueError) as error:
             if (path == "/proc/pressure/memory" and handle is None
@@ -498,7 +517,9 @@ class LibVirtAutoReclaim:
                             "%s guest memory PSI unavailable; skipping PSI reads until restart: %s",
                             name, error)
             else:
-                logging.debug("%s guest-agent read of %s failed: %s", name, path, error)
+                self._log_transient_error(
+                    name, "guest-agent-read", logging.DEBUG,
+                    "%s guest-agent read of %s failed: %s", name, path, error)
         finally:
             if handle is not None:
                 try:
@@ -816,9 +837,12 @@ class LibVirtAutoReclaim:
                    if backend.get("os") == "windows" and memstat.get("source") == "guest-agent"
                    else 15)
         if not 0 <= time() - updated <= max_age:
-            logging.warning("%s has stale or future-dated memory stats, skipping", name)
+            self._log_transient_error(
+                name, "stale-stats", logging.WARNING,
+                "%s has stale or future-dated memory stats, skipping", name)
             self.control_samples.pop(name, None)
             return
+        self._clear_transient_error(name, "stale-stats")
         previous = self.control_samples.get(name)
         source = memstat.get("source")
         sampled_at = memstat.get("sampled_at") if source == "guest-agent" else None
@@ -1139,6 +1163,7 @@ class LibVirtAutoReclaim:
         self.manual_increase_until.pop(name, None)
         self.control_samples.pop(name, None)
         self.guest_psi_unavailable.discard(name)
+        self.agent_faults.pop(name, None)
 
     def __refresh_domain(self, dom):
         name = dom.name()
@@ -1260,7 +1285,10 @@ class LibVirtAutoReclaim:
                 self.__forget_domain(name)
             elif event == libvirt.VIR_DOMAIN_EVENT_STARTED:
                 self.guest_psi_unavailable.discard(name)
-                # A preceding refresh may already have scheduled an OS retry.
+                # A preceding refresh may already have scheduled an OS retry;
+                # keep its fault state so the retry does not log a duplicate warning.
+                if name not in self.guest_os or self.agent_faults.get(name) != "os-info":
+                    self.agent_faults.pop(name, None)
                 if self.guest_os.get(name) is not None:
                     self.guest_os.pop(name, None)
                     self.guest_os_retry_at.pop(name, None)
