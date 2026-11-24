@@ -27,6 +27,7 @@ GUEST_SWAP_EMERGENCY_KIB_PER_SEC = 10 * SZ_1MiB
 GUEST_SWAP_VETO_KIB_PER_SEC = 64
 GUEST_SWAP_VETO_MIN_DROP_KIB = 256
 GUEST_OS_RETRY_INTERVAL = 60
+WINDOWS_EXEC_RETRY_INTERVAL = 60
 WINDOWS_STATUS_TIMEOUT = 5
 # Some QGA versions print PRId64 literally instead of the PID.
 GUEST_EXEC_PID_NOT_FOUND_PATTERN = re.compile(r"\bPID (?:-?\d+|lld|ld|I64d) does not exist$")
@@ -42,10 +43,19 @@ WINDOWS_MEMORY_COMMAND = (
     "$total=($pages | Measure-Object -Property AllocatedBaseSize -Sum).Sum; "
     "if ($null -eq $used) { $used=0 }; "
     "if ($null -eq $total) { $total=0 }; "
+    "$pf_drives=@($pages | ForEach-Object { ($_.Name -split '\\\\')[0] } | Select-Object -Unique); "
+    "if ($pf_drives.Count -eq 0) { $pf_drives=@($env:SystemDrive) }; "
+    "$disks=@(Get-CimInstance Win32_PerfFormattedData_PerfDisk_LogicalDisk | "
+    "Where-Object { $pf_drives -contains $_.Name }); "
+    "$r_lat=if ($disks.Count -gt 0) { ($disks | Measure-Object -Property AvgDiskSecPerRead -Average).Average } else { 0.002 }; "
+    "$w_lat=if ($disks.Count -gt 0) { ($disks | Measure-Object -Property AvgDiskSecPerWrite -Average).Average } else { 0.002 }; "
+    "$psi_some=[Math]::Min(100.0, [Math]::Round([double]$perf.PageReadsPersec * $r_lat * 100.0, 2)); "
+    "$psi_full=[Math]::Min(100.0, [Math]::Round([double]$perf.PageWritesPersec * $w_lat * 100.0, 2)); "
     "Write-Output \"$($os.TotalVisibleMemorySize)|$($perf.FreeAndZeroPageListBytes)|"
     "$($perf.CacheBytes)|$($perf.PagesPersec)|$used|$total|"
     "$($perf.SystemCacheResidentBytes)|$($perf.StandbyCacheCoreBytes)|"
-    "$($perf.StandbyCacheNormalPriorityBytes)|$($perf.StandbyCacheReserveBytes)\""
+    "$($perf.StandbyCacheNormalPriorityBytes)|$($perf.StandbyCacheReserveBytes)|"
+    "$psi_some|$psi_full\""
 )
 GUEST_MEMINFO_FIELDS = {
     "MemTotal": "actual",
@@ -365,7 +375,8 @@ class LibVirtAutoReclaim:
         windows_sample_max_age = max(30, interval * 3)
         state = self.windows_agent_state.setdefault(name, {"next_check": 0})
         now = monotonic()
-        if now >= state["next_check"] and not state.get("blocked"):
+        if (now >= state["next_check"] and now >= state.get("retry_at", 0)
+                and not state.get("blocked")):
             state["next_check"] = now + interval
             pid = state.get("pid")
             if pid is not None:
@@ -378,11 +389,17 @@ class LibVirtAutoReclaim:
                         if result.get("exitcode") != 0 or result.get("out-truncated"):
                             raise ValueError("PowerShell failed or its output was truncated")
                         output = base64.b64decode(result["out-data"], validate=True).decode("utf-8")
-                        values = [int(value) for value in output.strip().split("|")]
-                        if (len(values) != 10 or values[0] <= 0
+                        parts = output.strip().split("|")
+                        if len(parts) != 12:
+                            raise ValueError("invalid Windows memory counter count")
+                        values = [int(value) for value in parts[:10]]
+                        psi_some = float(parts[10].replace(",", "."))
+                        psi_full = float(parts[11].replace(",", "."))
+                        if (values[0] <= 0
                                 or not 0 <= values[1] <= values[0] * 1024
                                 or any(value < 0 for value in values[2:])
-                                or values[4] > values[5]):
+                                or values[4] > values[5]
+                                or not (0.0 <= psi_some <= 100.0 and 0.0 <= psi_full <= 100.0)):
                             raise ValueError("invalid Windows memory counters")
                         state["sample"] = {
                             "actual": values[0],
@@ -393,13 +410,17 @@ class LibVirtAutoReclaim:
                             "pagefile_used_kb": values[4] * SZ_1MiB,
                             "swap_total": values[5] * SZ_1MiB,
                             "swap_free": (values[5] - values[4]) * SZ_1MiB,
+                            "psi_some": psi_some,
+                            "psi_full": psi_full,
                             "last_update": state["started_wall"],
                             "sampled_at": state["started_at"], "source": "guest-agent",
                         }
                         logging.debug("%s Windows memory: cache=%s KiB protected_cache=%s KiB "
-                                      "standby_cache=%s KiB pages/sec=%s pagefile=%s KiB",
+                                      "standby_cache=%s KiB pages/sec=%s pagefile=%s KiB "
+                                      "psi_some=%.2f%% psi_full=%.2f%%",
                                       name, values[2] // 1024, (values[6] + values[7]) // 1024,
-                                      (values[8] + values[9]) // 1024, values[3], values[4] * SZ_1MiB)
+                                      (values[8] + values[9]) // 1024, values[3], values[4] * SZ_1MiB,
+                                      psi_some, psi_full)
                 except GuestExecPIDNotFound as error:
                     state.pop("pid")
                     state.pop("sample", None)
@@ -418,11 +439,22 @@ class LibVirtAutoReclaim:
                     if (not isinstance(result, dict) or isinstance(result.get("pid"), bool)
                             or not isinstance(result.get("pid"), int) or result["pid"] <= 0):
                         raise ValueError("guest-exec did not return a valid PID")
+                    state.pop("retry_at", None)
                     state.update(pid=result["pid"], started_at=now, started_wall=int(time()))
                 except (ImportError, libvirt.libvirtError, ValueError) as error:
-                    state["blocked"] = True
-                    logging.log(error_level, "%s cannot start Windows guest-exec; using balloon statistics "
-                                "until restart: %s", name, error)
+                    get_error_code = getattr(error, "get_error_code", None)
+                    timeout = getattr(libvirt, "VIR_ERR_AGENT_COMMAND_TIMEOUT", None)
+                    if (isinstance(error, libvirt.libvirtError) and timeout is not None
+                            and callable(get_error_code) and get_error_code() == timeout):
+                        state["retry_at"] = monotonic() + WINDOWS_EXEC_RETRY_INTERVAL
+                        state["next_check"] = state["retry_at"]
+                        logging.log(error_level, "%s cannot start Windows guest-exec; using cached or "
+                                    "balloon statistics and retrying in %s seconds: %s",
+                                    name, WINDOWS_EXEC_RETRY_INTERVAL, error)
+                    else:
+                        state["blocked"] = True
+                        logging.log(error_level, "%s cannot start Windows guest-exec; using balloon "
+                                    "statistics until restart: %s", name, error)
         sample = state.get("sample")
         if sample is not None and 0 <= now - sample["sampled_at"] <= windows_sample_max_age:
             return sample
@@ -683,10 +715,12 @@ class LibVirtAutoReclaim:
             _, reclaim_floor = self._memory_floors(dom, memstat, parameters, memory_method, bounds)
             floor = str(reclaim_floor // SZ_1MiB)
         if stats_method == "guest-agent":
-            if backend.get("os") != "windows":
+            if backend.get("os") == "windows":
+                psi_some = memstat.get("psi_some")
+            else:
                 psi_some, _ = self._get_guest_agent_memory_pressure(dom)
-                if psi_some is not None:
-                    psi = f"{psi_some:.2f}".rstrip("0").rstrip(".") + "%"
+            if psi_some is not None:
+                psi = f"{psi_some:.2f}".rstrip("0").rstrip(".") + "%"
             swap_total, swap_free = memstat.get("swap_total"), memstat.get("swap_free")
             if swap_total is not None and swap_free is not None and 0 <= swap_free <= swap_total:
                 swap_used = str((swap_total - swap_free) // SZ_1MiB)
@@ -873,9 +907,12 @@ class LibVirtAutoReclaim:
             reclaim_pressure = max(0.0, host_pressure)
         psi_some = psi_full = None
         low_headroom = usable < 2 * reserve
-        if (source == "guest-agent" and backend.get("os") != "windows"
-                and (low_headroom or reclaim_pressure > 0)):
-            psi_some, psi_full = self._get_guest_agent_memory_pressure(dom)
+        if source == "guest-agent" and (low_headroom or reclaim_pressure > 0):
+            if backend.get("os") == "windows":
+                psi_some = memstat.get("psi_some")
+                psi_full = memstat.get("psi_full")
+            else:
+                psi_some, psi_full = self._get_guest_agent_memory_pressure(dom)
         emergency = emergency or (low_headroom and psi_full is not None and psi_full > 1.0)
         if emergency:
             delta = max(delta, reserve - usable + max(0, used_rate) * self.poll_interval,
@@ -1062,7 +1099,10 @@ class LibVirtAutoReclaim:
         if (period is None or self.vm_backends.get(name, {}).get("os") != "windows"
                 or name in self.pending_targets):
             return period
-        sample = self.windows_agent_state.get(name, {}).get("sample")
+        state = self.windows_agent_state.get(name, {})
+        if "retry_at" in state:
+            return period
+        sample = state.get("sample")
         interval = self.__vm_config_for_name(name).get("windows_agent_interval", 10)
         if (sample is not None and sample.get("source") == "guest-agent"
                 and 0 <= monotonic() - sample["sampled_at"] <= max(30, interval * 3)):

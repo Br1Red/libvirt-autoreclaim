@@ -77,18 +77,31 @@ For Windows (`id: mswindows`), the daemon does not read Linux `/proc` files.
 It asynchronously runs PowerShell via QGA `guest-exec` and polls
 `guest-exec-status` no more often than every `windows_agent_interval` seconds
 (10 by default), with at most one
-process in flight per VM to limit PowerShell/CIM overhead. Windows agent samples
+tracked process in flight per VM to limit PowerShell/CIM overhead. If the
+`guest-exec` start command times out, the daemon retries after 60 seconds at the
+next polling opportunity. It continues using any fresh cached agent sample,
+then falls back to balloon statistics when available. A timed-out command may
+still have started in the guest without returning its PID, so an untracked
+process can overlap a retry. Other start errors remain blocked until VM or
+daemon restart. Windows agent samples
 remain valid for `max(30, windows_agent_interval * 3)` seconds from process
-launch (30 by default); Linux and balloon samples
-retain their 15-second freshness limit. It reads physical total and available memory,
-system cache, pages/sec and pagefile allocation and usage using CIM. The
-controller uses hypervisor allocation (`memoryStats().actual` for balloon,
-fixed RAM plus plugged devices for virtio-mem) rather than Windows
-`TotalVisibleMemorySize` for `Actual` and target completion. Available memory
-is `(FreeAndZeroPageListBytes + StandbyCacheNormalPriorityBytes +
-StandbyCacheReserveBytes) / 1024`, bounded by Windows-visible memory and,
-for adjustable guests, hypervisor allocation. `FreePhysicalMemory` is not used
-as a free-list counter to avoid potentially counting standby twice.
+launch (30 by default); Linux and balloon samples retain their 15-second
+freshness limit. It reads physical total and available memory, system cache,
+pages/sec and pagefile allocation and usage using CIM. It also estimates
+`psi_some` as 100 times page reads/sec multiplied by average read latency, and
+`psi_full` as 100 times page writes/sec multiplied by average write latency of
+pagefile-bearing logical disks. The estimates are capped at 100%; when no
+matching disk counters are available, a 2 ms latency is assumed. These are
+Windows pressure heuristics, not measurements equivalent to Linux PSI.
+The controller applies the same PSI thresholds to these estimates, and `status`
+shows `psi_some` in its `PSI` column. The controller uses hypervisor allocation
+(`memoryStats().actual` for balloon, fixed RAM plus plugged devices for
+virtio-mem) rather than Windows `TotalVisibleMemorySize` for `Actual` and target
+completion. Available memory is
+`(FreeAndZeroPageListBytes + StandbyCacheNormalPriorityBytes +
+StandbyCacheReserveBytes) / 1024`, bounded by Windows-visible memory and, for
+adjustable guests, hypervisor allocation. `FreePhysicalMemory` is not used as
+a free-list counter to avoid potentially counting standby twice.
 A switch between balloon and agent statistics resets
 the controller sample without classifying the change as an external RAM increase.
 The pagefile counters populate `swap_total` and `swap_free`, enabling the existing
@@ -96,8 +109,11 @@ growth-rate veto and emergency protections and the `Swap_Used` status column
 when a Windows agent sample is available. Pages/sec above
 `windows_paging_veto_pages_per_sec` (1000 by default) blocks reclaim
 but never forces growth. Emergency growth relies on low available RAM, rapid
-memory consumption or increasing pagefile usage. This is a Windows-specific heuristic,
-not a conversion to Linux PSI: hard faults can also read memory-mapped files.
+memory consumption, increasing pagefile usage, or `psi_full` above 1% while
+usable memory is below twice the reserve. `psi_some` above 10% in that same
+low-headroom range triggers ordinary growth. These are Windows-specific
+heuristics, not measurements equivalent to Linux PSI: hard faults can also read
+memory-mapped files.
 The Windows guest reclaim floor is `(max(0, actual - usable) + minimum reserve) /
 (1 - keep_free_ratio)`, bounded by the static floor and maximum RAM, with the
 denominator bounded below by 0.1. This conservatively protects memory not counted

@@ -466,7 +466,7 @@ class AdaptiveControllerTests(unittest.TestCase):
             {"exited": False},
             {"exited": True, "exitcode": 0,
              "out-data": base64.b64encode(
-                 b"1048576|536870912|10485760|123|42|128|2097152|1048576|4194304|5242880\r\n").decode()},
+                 b"1048576|536870912|10485760|123|42|128|2097152|1048576|4194304|5242880|1.25|0.75\r\n").decode()},
         ])
 
         def qemu_agent_command(_domain, raw, _timeout, _flags):
@@ -503,6 +503,8 @@ class AdaptiveControllerTests(unittest.TestCase):
         self.assertEqual(stats["pagefile_used_kb"], 42 * 1024)
         self.assertEqual(stats["swap_total"], 128 * 1024)
         self.assertEqual(stats["swap_free"], 86 * 1024)
+        self.assertEqual(stats["psi_some"], 1.25)
+        self.assertEqual(stats["psi_full"], 0.75)
         self.assertEqual(stats["sampled_at"], 100)
 
     def test_windows_agent_start_failure_falls_back_without_relaunching(self):
@@ -521,11 +523,60 @@ class AdaptiveControllerTests(unittest.TestCase):
         self.assertIn("guest-exec disabled", logs.output[0])
         proc.assert_not_called()
 
+    def test_windows_agent_start_timeout_retries_after_60_seconds(self):
+        self.controller.vm_backends["guest-a"] = {
+            "type": "balloon", "has_guest_agent": True, "os": "windows"}
+        self.controller.config["default"]["windows_agent_interval"] = 120
+        error = autoreclaim.libvirt.libvirtError("guest agent command timed out")
+        error.get_error_code = lambda: 112
+        sample = b"1048576|536870912|0|0|0|0|0|0|0|0|0|0"
+        agent = Mock(side_effect=[
+            error, error, json.dumps({"return": {"pid": 42}}),
+            json.dumps({"return": {"exited": True, "exitcode": 0,
+                                   "out-data": base64.b64encode(sample).decode()}}),
+            json.dumps({"return": {"pid": 43}}),
+        ])
+        with patch.object(autoreclaim.libvirt, "VIR_ERR_AGENT_COMMAND_TIMEOUT", 112, create=True), \
+                patch.dict(sys.modules, {"libvirt_qemu": types.SimpleNamespace(qemuAgentCommand=agent)}):
+            with self.assertLogs(level="WARNING") as logs:
+                self.assertEqual(self.controller._get_domain_memstats(self.domain)["source"], "balloon")
+            self.assertIn("retrying in 60 seconds", logs.output[0])
+            self.now = 159
+            self.assertIsNone(self.controller._get_windows_guest_meminfo(self.domain))
+            self.assertIsNone(self.controller._get_windows_status_meminfo(self.domain))
+            self.assertEqual(agent.call_count, 1)
+            self.now = 160
+            with self.assertLogs(level="WARNING"):
+                self.assertIsNone(self.controller._get_windows_guest_meminfo(self.domain))
+            self.now = 219
+            self.assertIsNone(self.controller._get_windows_guest_meminfo(self.domain))
+            self.assertEqual(agent.call_count, 2)
+            self.now = 220
+            self.assertIsNone(self.controller._get_windows_guest_meminfo(self.domain))
+            self.assertEqual(self.controller.windows_agent_state["guest-a"]["pid"], 42)
+            self.now = 340
+            stats = self.controller._get_domain_memstats(self.domain)
+        self.assertEqual(stats["source"], "guest-agent")
+        self.assertEqual(stats["usable"], 524288)
+        self.assertEqual(agent.call_count, 5)
+
+    def test_windows_start_timeout_keeps_base_poll_period_with_cached_sample(self):
+        self.controller.config["default"]["windows_agent_interval"] = 120
+        self.controller.vm_backends["guest-a"] = {"type": "balloon", "os": "windows"}
+        state = self.controller.windows_agent_state["guest-a"] = {
+            "sample": {"source": "guest-agent", "sampled_at": self.now},
+            "retry_at": self.now + 60,
+        }
+        period = self.controller._LibVirtAutoReclaim__effective_stats_period
+        self.assertEqual(period("guest-a"), 2)
+        state.pop("retry_at")
+        self.assertEqual(period("guest-a"), 120)
+
     def test_windows_available_memory_is_bounded_by_visible_and_allocated_ram(self):
         self.controller.vm_backends["guest-a"] = {
             "type": "balloon", "has_guest_agent": True, "os": "windows"}
         result = {"exited": True, "exitcode": 0, "out-data": base64.b64encode(
-            b"1048576|536870912|0|0|0|0|0|0|1073741824|0").decode()}
+            b"1048576|536870912|0|0|0|0|0|0|1073741824|0|0|0").decode()}
         agent = Mock(side_effect=[
             json.dumps({"return": {"pid": 42}}), json.dumps({"return": result}),
             json.dumps({"return": {"pid": 43}})])
@@ -545,7 +596,7 @@ class AdaptiveControllerTests(unittest.TestCase):
         agent = Mock(side_effect=[
             json.dumps({"return": {"pid": 42}}),
             json.dumps({"return": {"exited": True, "exitcode": 0, "out-data": base64.b64encode(
-                b"1048576|536870912|10485760|0|42|128|2097152|1048576|4194304|5242880").decode()}}),
+                b"1048576|536870912|10485760|0|42|128|2097152|1048576|4194304|5242880|0|0").decode()}}),
         ])
         with patch.dict(sys.modules, {"libvirt_qemu": types.SimpleNamespace(qemuAgentCommand=agent)}), \
                 patch.object(autoreclaim, "sleep", side_effect=lambda delay: setattr(
@@ -626,7 +677,7 @@ class AdaptiveControllerTests(unittest.TestCase):
                         raise error
                     return json.dumps({"return": {
                         "exited": True, "exitcode": 0, "out-data": base64.b64encode(
-                            b"1048576|536870912|0|0|0|0|0|0|0|0").decode()}})
+                            b"1048576|536870912|0|0|0|0|0|0|0|0|0|0").decode()}})
 
                 with patch.object(autoreclaim.libvirt, "VIR_ERR_AGENT_COMMAND_FAILED", 113,
                                   create=True), \
@@ -679,13 +730,19 @@ class AdaptiveControllerTests(unittest.TestCase):
                 {"exited": True, "exitcode": 0, "out-truncated": True},
                 {"exited": True, "exitcode": 0, "out-data": "invalid!"},
                 {"exited": True, "exitcode": 0,
-                 "out-data": base64.b64encode(b"100|103424|0|0|0|0|0|0|0|0").decode()},
+                 "out-data": base64.b64encode(b"100|103424|0|0|0|0|0|0|0|0|0|0").decode()},
                 {"exited": True, "exitcode": 0,
-                 "out-data": base64.b64encode(b"100||0|0|0|0|0|0|0|0").decode()},
+                 "out-data": base64.b64encode(b"100||0|0|0|0|0|0|0|0|0|0").decode()},
                 {"exited": True, "exitcode": 0,
-                 "out-data": base64.b64encode(b"100|50|0|0|2|1|0|0|0|0").decode()},
+                 "out-data": base64.b64encode(b"100|50|0|0|2|1|0|0|0|0|0|0").decode()},
                 {"exited": True, "exitcode": 0,
-                 "out-data": base64.b64encode(b"100|50|0|0|0|0|-1|0|0|0").decode()}):
+                 "out-data": base64.b64encode(b"100|50|0|0|0|0|-1|0|0|0|0|0").decode()},
+                {"exited": True, "exitcode": 0,
+                 "out-data": base64.b64encode(b"100|50|0|0|0|0|0|0|0|0|-0.1|0").decode()},
+                {"exited": True, "exitcode": 0,
+                 "out-data": base64.b64encode(b"100|50|0|0|0|0|0|0|0|0|0|100.01").decode()},
+                {"exited": True, "exitcode": 0,
+                 "out-data": base64.b64encode(b"100|50|0|0|0|0|0|0|0|0|bad|0").decode()}):
             with self.subTest(result=result):
                 self.now = 100
                 self.controller.windows_agent_state.clear()
@@ -857,10 +914,56 @@ class AdaptiveControllerTests(unittest.TestCase):
         self.controller.vm_backends["guest-a"] = {"type": "balloon", "os": "windows"}
         stats = {"actual": 4194304, "usable": 2097152, "source": "guest-agent",
                  "protected_cache_kb": 2097152, "standby_cache_kb": 1048576,
-                 "swap_total": 131072, "swap_free": 88064}
-        with patch.object(self.controller, "_get_domain_memstats", return_value=stats):
+                 "swap_total": 131072, "swap_free": 88064, "psi_some": 0.4}
+        with patch.object(self.controller, "_get_domain_memstats", return_value=stats), \
+                patch.object(self.controller, "_get_guest_agent_memory_pressure") as psi:
             row = self.controller.dom_status(self.domain)
-        self.assertEqual(row[-3:], ("2844", "n/a", "42"))
+        psi.assert_not_called()
+        self.assertEqual(row[-3:], ("2844", "0.4%", "42"))
+
+    def test_windows_agent_psi_controls_emergency_growth_and_reclaim_veto(self):
+        self.controller.vm_backends["guest-a"] = {"type": "balloon", "os": "windows"}
+        reserve = self.controller.dom_keep_usable(self.domain, self.domain.memory)
+        low_memory_stats = {
+            **self.domain.memoryStats(), "source": "guest-agent",
+            "last_update": self.now, "sampled_at": self.now,
+            "usable": reserve - 1, "psi_some": 0.0, "psi_full": 1.01,
+        }
+        with patch.object(self.controller, "_get_guest_agent_memory_pressure") as guest_psi:
+            self.controller.process_domainID(self.domain, 1, low_memory_stats)
+        guest_psi.assert_not_called()
+        self.assertGreater(self.domain.calls[-1], low_memory_stats["actual"])
+
+        self.controller.control_samples.clear()
+        self.controller.memory_targets.clear()
+        self.controller.pending_targets.clear()
+        self.domain.memory, self.domain.usable = 1048576, 700000
+        self.domain.calls.clear()
+        some_pressure_stats = {
+            **self.domain.memoryStats(), "source": "guest-agent",
+            "last_update": self.now, "sampled_at": self.now,
+            "psi_some": 10.01, "psi_full": 0.0,
+        }
+        with patch.object(self.controller, "_get_guest_agent_memory_pressure") as guest_psi:
+            self.controller.process_domainID(self.domain, 1, some_pressure_stats)
+        guest_psi.assert_not_called()
+        self.assertGreater(self.domain.calls[-1], some_pressure_stats["actual"])
+
+        self.controller.control_samples.clear()
+        self.controller.memory_targets.clear()
+        self.controller.pending_targets.clear()
+        self.domain.memory, self.domain.usable = 4194304, 2097152
+        self.domain.calls.clear()
+        reclaim_stats = {
+            **self.domain.memoryStats(), "source": "guest-agent",
+            "last_update": self.now, "sampled_at": self.now,
+            "psi_some": 0.0, "psi_full": 0.11,
+        }
+        with patch.object(self.controller, "host_memory_pressure", return_value=1), \
+                patch.object(self.controller, "_get_guest_agent_memory_pressure") as guest_psi:
+            self.controller.process_domainID(self.domain, 1, reclaim_stats)
+        guest_psi.assert_not_called()
+        self.assertEqual(self.domain.calls, [])
 
     def test_windows_standby_cache_does_not_raise_floor_or_block_reclaim(self):
         self.controller.vm_backends["guest-a"] = {"type": "balloon", "os": "windows"}
