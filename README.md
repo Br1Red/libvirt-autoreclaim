@@ -5,6 +5,33 @@ memory through balloon or virtio-mem devices. An adaptive EWMA/PD controller
 balances guest reserves against host memory pressure, with slow reclaim and
 rapid guest memory growth.
 
+## Contents
+
+- [Installation](#installation)
+- [VM requirements](#vm-requirements)
+- [Guest memory statistics](#guest-memory-statistics)
+- [Monitoring and polling](#monitoring-and-polling)
+- [Command line and status](#command-line-and-status)
+- [Configuration](#configuration)
+- [Configuration tuning](#configuration-tuning)
+- [Adaptive controller](#adaptive-controller)
+- [Converting VM memory XML](#converting-vm-memory-xml)
+- [Shutdown](#shutdown)
+
+## Installation
+
+Requires Python 3 and the `libvirt-python` bindings (for example, the
+`python3-libvirt` package on Debian/Ubuntu).
+`make install` also installs `libvirt-mem-convert` in `/usr/bin` and its manual
+page in `/usr/share/man/man1`. The converter requires Python 3.7 or later.
+`virsh` is needed only for direct VM operation.
+
+```
+~# make install
+~# systemctl enable libvirt-autoreclaim
+~# systemctl start libvirt-autoreclaim
+```
+
 ## VM Requirements
 
 Monitoring requires `auto_reclaim: true` in the VM's effective configuration.
@@ -20,6 +47,35 @@ virtio-mem device. A balloon device normally defines a stats period from 1 to
 </devices>
 ```
 
+When no valid balloon stats period is configured, the daemon polls at the
+default 5-second interval. Without a usable guest agent, a missing, non-numeric,
+zero, or greater-than-5 period produces a warning and the VM is not monitored.
+`autodeflate='on'` is recommended, but optional; its absence produces a warning
+only. The daemon also warns when a balloon device has no `stats period` even
+if QEMU Guest Agent is available as the primary statistics source.
+
+When a VM has virtio-mem devices but no balloon device, the QEMU Guest Agent
+channel is required to provide guest memory statistics. The daemon then adjusts
+memory by updating the virtio-mem device requests live; no SPICE channel is
+required. If both devices are enabled, the daemon adjusts only virtio-mem.
+When virtio-mem sizes are available, `Actual` is the fixed RAM plus the
+currently plugged virtio-mem. Guest Agent `Usable` is capped at this allocation.
+`Usable` can still come from fresh balloon statistics when the agent is unavailable.
+If the balloon has been adjusted separately, those values may not
+describe the same guest memory allocation. Prefer disabling the balloon with
+`<memballoon model='none'/>` and using QEMU Guest Agent for statistics on
+virtio-mem guests.
+
+A VM without a balloon device is also monitored when its XML defines both a
+SPICE channel (`type='spicevmc'`) and the `org.qemu.guest_agent.0` Unix
+channel. In this case, the VM appears as `read-only` in `status`, which reads its
+memory statistics from the agent. The daemon does not poll it, adjust its
+memory, or include it when choosing the polling interval.
+
+## Guest memory statistics
+
+### Guest Agent and OS identification
+
 For memory control and `status`, the daemon identifies the guest OS once per
 VM start with QEMU Guest Agent `guest-get-osinfo`. With `--debug`, it logs the
 guest name, detected OS ID and backend OS classification. If identification fails, it
@@ -27,10 +83,14 @@ logs a warning once per VM, uses balloon statistics and silently retries identif
 every 60 seconds until the agent responds, allowing for delayed startup in the guest.
 Domain refreshes and the following start event preserve a pending retry to avoid
 duplicate warnings; stopping or crashing the VM clears it.
-Successful identification remains cached until the VM restarts. On other
-identified guests, it reads `MemTotal`, `MemAvailable`, `AnonPages`,
-`Active(file)`, `Inactive(file)`, `SwapTotal`, and `SwapFree` in a single
-`guest-file-read` of the guest's `/proc/meminfo` per poll when the VM has a
+Successful identification remains cached until the VM restarts. Each agent
+command has a one-second timeout.
+
+### Linux guest statistics
+
+On identified non-Windows guests, the daemon reads `MemTotal`, `MemAvailable`,
+`AnonPages`, `Active(file)`, `Inactive(file)`, `SwapTotal`, and `SwapFree` in a
+single `guest-file-read` of the guest's `/proc/meminfo` per poll when the VM has a
 QEMU Guest Agent channel. The XML must define the
 `org.qemu.guest_agent.0` Unix channel and the agent must be running and
 reachable. With a valid guest sample, balloon guests use libvirt's
@@ -38,8 +98,18 @@ reachable. With a valid guest sample, balloon guests use libvirt's
 for usable RAM. Guest `MemTotal` does not track balloon inflation and must not
 be used to confirm resize targets. Missing hypervisor allocation skips the
 sample rather than substituting `MemTotal`. If the agent times out or cannot
-read meminfo, it falls back to fresh balloon statistics when available. Each
-agent command has a one-second timeout.
+read meminfo, it falls back to fresh balloon statistics when available.
+
+The daemon reads guest `/proc/pressure/memory` after a successful Guest Agent
+meminfo read when available memory is below twice the effective reserve, or
+when a negative PD correction can drive reclaim under host or idle pressure.
+If the guest reports that the file does not exist (for example, when its kernel
+does not expose PSI), the daemon logs one warning per VM and skips further PSI
+reads until that VM or the daemon restarts. Meminfo sampling and reclaim continue
+without the optional PSI signal; transient Guest Agent errors do not disable
+subsequent PSI reads.
+
+### Balloon statistics
 
 Balloon samples retain the optional cumulative `swap_in`, `swap_out` and
 `major_fault` counters reported by libvirt. Between successive balloon samples,
@@ -48,8 +118,6 @@ any increase in `swap_out` or a `major_fault` rate above
 blocks reclaim without forcing growth. Missing counters, counter resets and
 changes of statistics source do not trigger this veto. Major faults can also
 reflect file-backed reads, so this is a conservative paging heuristic.
-
-**Limitations when only balloon statistics are available**
 
 - A working guest balloon driver must report `actual`, `usable` and
   `last_update`. Allocation alone is not enough to control memory. Invalid,
@@ -73,6 +141,8 @@ reflect file-backed reads, so this is a conservative paging heuristic.
   grace-period protections remain active, but they cannot guarantee avoidance
   of guest paging or OOM. A usable Guest Agent provides more detailed telemetry.
 
+### Windows guest statistics
+
 For Windows (`id: mswindows`), the daemon does not read Linux `/proc` files.
 It asynchronously runs PowerShell via QGA `guest-exec` and polls
 `guest-exec-status` no more often than every `windows_agent_interval` seconds
@@ -83,14 +153,25 @@ next polling opportunity. It continues using any fresh cached agent sample,
 then falls back to balloon statistics when available. A timed-out command may
 still have started in the guest without returning its PID, so an untracked
 process can overlap a retry. Other start errors remain blocked until VM or
-daemon restart. Windows agent samples
-remain valid for `max(30, windows_agent_interval * 3)` seconds from process
-launch (30 by default); Linux and balloon samples retain their 15-second
-freshness limit. It reads physical total and available memory, system cache,
-pages/sec and pagefile allocation and usage using CIM. It also estimates
+daemon restart.
+
+PowerShell, CIM and the QGA `guest-exec` commands must be enabled in the guest.
+If checking a known PID times out or the agent disconnects, the daemon keeps
+tracking it and retries the status check. If QGA explicitly reports that the
+PID is no longer registered (`PID ... does not exist`), the daemon discards
+the PID and cached sample, then starts a new collection instead of retrying the
+lost PID indefinitely. This handled condition is logged as a warning without
+a duplicate libvirt error. Other command failures do not invalidate the PID.
+Failed or incomplete samples use fresh balloon statistics when available.
+
+Windows agent samples remain valid for `max(30, windows_agent_interval * 3)`
+seconds from process launch (30 by default); Linux and balloon samples retain
+their 15-second freshness limit. CIM provides physical total and available
+memory, system cache, pages/sec and pagefile allocation and usage. It also estimates
 `psi_some` as 100 times page reads/sec multiplied by average read latency, and
 `psi_full` as 100 times page writes/sec multiplied by average write latency of
-pagefile-bearing logical disks. The estimates are capped at 100%; when no
+pagefile-bearing logical disks. Without a pagefile, it uses the system drive.
+The estimates are rounded to two decimal places and capped at 100%; when no
 matching disk counters are available, a 2 ms latency is assumed. These are
 Windows pressure heuristics, not measurements equivalent to Linux PSI.
 The controller applies the same PSI thresholds to these estimates, and `status`
@@ -128,58 +209,8 @@ as `standby_cache_kb` and included fully in `usable`, so they do not contribute
 to the memory protected by the floor.
 Total cache, protected cache, standby cache, pages/sec and pagefile usage
 are logged at debug level.
-PowerShell, CIM and the QGA `guest-exec` commands must be enabled in the guest.
-If starting the command fails or its PID is uncertain, the daemon logs a
-warning and uses balloon statistics until the VM restarts; it does not risk
-launching another process whose PID may have been lost. If checking a known PID
-times out or the agent disconnects, the daemon keeps tracking it and retries
-the status check. If QGA explicitly reports that the PID is no longer registered
-(`PID ... does not exist`), the daemon discards the PID and cached sample, then
-starts a new collection instead of retrying the lost PID indefinitely.
-This handled condition is logged as a warning without a duplicate libvirt error.
-Other command failures do not invalidate the PID. Failed or
-incomplete samples use fresh balloon statistics when available. For Windows,
-`status` launches one PowerShell sample per VM and waits for completion, checking
-the PID every 100 ms rather than using the daemon's sampling interval. The wait
-budget is five seconds per VM; an in-flight agent RPC may add its one-second
-timeout. A valid sample shows `agent/balloon` or `agent/virtio-mem` and pagefile
-usage in `Swap_Used`. A failed or timed-out sample falls back to fresh balloon
-statistics, or reports `unavailable/read-only` when no other metrics are available.
-These failures are visible only with `--debug` for `status`.
-No second PowerShell process is launched after completion or failure. A timeout
-does not kill the guest process; its PID is retained for the lifetime of that
-CLI invocation, but is not shared with the daemon or subsequent invocations.
-Windows samples for `status` run concurrently in the existing pool, up to
-`general.agent_workers` at a time (4 by default). All agent tasks finish before
-hypervisor statistics, XML inspection and table rows are processed serially.
-Row order is unchanged. Up to the worker limit, slow Windows guests wait in
-parallel rather than adding their timeout budgets together; larger fleets
-are processed in batches.
-When no valid balloon stats
-period is configured, the daemon polls at the default 5-second interval.
-Without a usable guest agent, a missing, non-numeric, zero, or greater-than-5
-period produces a warning and the VM is not monitored. `autodeflate='on'` is
-recommended, but optional; its absence produces a warning only.
-The daemon also warns when a balloon device has no `stats period` even if
-QEMU Guest Agent is available as the primary statistics source.
 
-A VM without a balloon device is also monitored when its XML defines both a
-SPICE channel (`type='spicevmc'`) and the QEMU Guest Agent channel above. In
-this case, the VM appears as `read-only` in `status`, which reads its memory
-statistics from the agent. The daemon does not poll it, adjust its memory,
-or include it when choosing the polling interval.
-
-When a VM has virtio-mem devices but no balloon device, the QEMU Guest Agent
-channel is required to provide guest memory statistics. The daemon then adjusts
-memory by updating the virtio-mem device requests live; no SPICE channel is
-required. If both devices are enabled, the daemon adjusts only virtio-mem.
-When virtio-mem sizes are available, `Actual` is the fixed RAM plus the
-currently plugged virtio-mem. Guest Agent `Usable` is capped at this allocation.
-`Usable` can still come from fresh balloon statistics when the agent is unavailable.
-If the balloon has been adjusted separately, those values may not
-describe the same guest memory allocation. Prefer disabling the balloon with
-`<memballoon model='none'/>` and using QEMU Guest Agent for statistics on
-virtio-mem guests.
+## Monitoring and polling
 
 The daemon uses `libvirt-python` with one persistent connection to
 `qemu:///system`. The event-loop timer interval is the greatest common divisor
@@ -200,22 +231,15 @@ For Windows with a valid Guest Agent memory sample, the effective period is
 `max(stats_period, windows_agent_interval)`, avoiding repeated reads of the same
 cached sample. OS identification alone does not slow polling: before the first
 valid sample, or after it expires, the original stats period is used for balloon
-fallback. An outstanding memory target also keeps the original period so
-hypervisor allocation can be checked more frequently. Linux periods are unchanged.
+fallback. An outstanding memory target or a pending `guest-exec` startup retry
+also keeps the original period so allocation or retry deadlines can be checked
+more frequently. Linux periods are unchanged.
 The global GCD is recalculated after each control cycle, including transitions
 between agent and balloon sampling or changes in pending memory targets.
 For large fleets using the agent, prefer a 3- to 5-second stats period to limit
 polling overhead. Each VM is controlled only when its statistics have updated. Guest Agent
 samples use monotonic collection time, so two samples in the same wall-clock
-second are still distinct. Guest
-`/proc/pressure/memory` is read only after a successful Guest Agent meminfo
-read, when available memory is below twice the effective reserve or the PD
-controller computes a negative correction.
-If the guest reports that `/proc/pressure/memory` does not exist (for example,
-when its kernel does not expose PSI), the daemon logs one warning per VM and
-skips further PSI reads until that VM or the daemon restarts. Meminfo sampling
-and reclaim continue without the optional PSI signal; transient Guest Agent
-errors do not disable subsequent PSI reads.
+second are still distinct.
 Guest Agent libvirt error messages include the domain name, including calls
 made by parallel sampling workers.
 
@@ -239,91 +263,7 @@ Monitoring messages list the initial monitored VMs, then only changes:
 when it leaves. Configuration reloads and repeated lifecycle events do not
 repeat these messages for unchanged VMs.
 
-## Converting VM memory XML
-
-`libvirt-mem-convert` converts libvirt domain XML between `virtio-balloon` and
-`virtio-mem`. It can read and write XML files, or update a VM directly through
-`virsh`. The script requires Python 3.7 or later and uses the Python standard
-library to process XML. `virsh` is required only for direct VM operation.
-
-The conversion modes are:
-
-- `to-virtiomem`: sets a fixed base memory and configures a `virtio-mem` device,
-  NUMA topology, and maximum memory. The base defaults to `1GiB` and is rounded
-  down to a multiple of 2 MiB. The generated NUMA cell excludes vCPU IDs
-  explicitly marked `enabled='no'`. If NUMA cells already exist, the converter
-  preserves all but the first cell's memory allocation and assigns the
-  remaining base memory to the first cell. It rejects a base that leaves no
-  memory for that cell. By default, the balloon is disabled with
-  `model='none'`; `-k` (`--keep-balloon`) preserves its current model (or
-  creates a `virtio` balloon if one is absent).
-- `to-balloon`: removes `virtio-mem` devices and restores the VM's memory
-  configuration for `virtio-balloon`. When NUMA cells are present, their memory
-  defines the fixed base, so any virtio-mem capacity already included in the
-  top-level `<memory>` is not counted twice. If the balloon model is `none`,
-  it is changed to `virtio`.
-
-Convert an XML file and save the result:
-
-```bash
-libvirt-mem-convert to-virtiomem vm.xml vm-virtiomem.xml --base-memory 2GiB
-```
-
-With `to-virtiomem`, use `--initial-memory 3GiB` (or `-i 3GiB`) to start with
-3 GiB of total guest memory instead of the input XML's `<currentMemory>` (or
-`<memory>` if it is absent). The value must be between the fixed base and the
-selected maximum memory. If it is not a multiple of 2 MiB, the converter
-rounds it down and reports the requested and effective values on standard
-error. In this direction, the option requires a domain without a `virtio-mem`
-device.
-
-With `to-balloon`, `--initial-memory` sets `<currentMemory>` directly, without
-2 MiB rounding or changing the calculated `<memory>`. The value must be
-positive and no greater than the resulting `<memory>`.
-
-Use `--max-memory SIZE` (or `-m SIZE`) to override the maximum total guest
-memory in either direction. With `to-virtiomem`, it replaces the input
-`<memory>` as the maximum. The order of `--base-memory` and `--max-memory` on
-the command line does not matter: the converter rounds down the base first,
-then rounds down the capacity above that base to whole 2 MiB blocks. For
-example, with `--base-memory 1024M --max-memory 2049M`, the resulting
-`<maxMemory>` is 2048 MiB: 1024 MiB of base memory plus 1024 MiB of virtio-mem
-capacity. With `to-balloon`, `--max-memory` sets the output `<memory>` directly
-without rounding. If the initial memory would exceed the requested maximum,
-also specify a lower `--initial-memory`.
-
-To keep the existing balloon model during conversion:
-
-```bash
-libvirt-mem-convert to-virtiomem vm.xml vm-virtiomem.xml -k
-```
-
-The output XML is written atomically, so the input and output paths may be the
-same. Replacing an existing file preserves its permission bits; a new file
-uses the system's normal file creation permissions.
-
-Preview the changes without writing a file with `-n` (`--dry-run`).
-Use `-L` (`--color`) with `auto`, `always`, or `never`:
-
-```bash
-libvirt-mem-convert to-virtiomem vm.xml -n -L always
-```
-
-To update a VM directly with `-V` (`--vm`), it must be shut off, persistent,
-and have no snapshots. Preview first, then omit `-n` to apply the conversion.
-`--connect` optionally selects the libvirt URI (otherwise `virsh` uses its
-default):
-
-```bash
-libvirt-mem-convert to-virtiomem -V guest-a --base-memory 2GiB -n
-libvirt-mem-convert to-virtiomem --vm guest-a --base-memory 2GiB
-libvirt-mem-convert to-balloon --vm guest-a
-```
-
-Use `libvirt-mem-convert --help` for all options and `man 1 libvirt-mem-convert`
-for the manual.
-
-## Configuration
+## Command line and status
 
 The configuration file defaults to `/etc/libvirt/autoreclaim.json`. Select a
 different file with `-c` or `--config`:
@@ -363,11 +303,33 @@ source from the memory adjustment mechanism. `guest-agent` is displayed as
   available. Without both guest metrics, it uses `max(0, actual - usable)`
   when actual and usable memory are available, including balloon samples.
   This is a reclaim limit, not a growth target; read-only VMs show `n/a`.
-- `PSI`: guest memory `some avg10`, reported as a percentage. `status` reads
-  it once per VM whose `Backend` starts with `agent/`; it shows `n/a` if
-  unavailable. This does not change PSI polling in the daemon.
-- `Swap_Used`: guest `SwapTotal - SwapFree` in MiB from the same meminfo sample,
-  or `n/a` if the counters are unavailable.
+- `PSI`: Linux guest memory `some avg10`, or the Windows `psi_some` estimate,
+  reported as a percentage. `status` shows `n/a` if unavailable. This does not
+  change PSI polling in the daemon.
+- `Swap_Used`: guest `SwapTotal - SwapFree` in MiB, or Windows pagefile usage,
+  from the guest sample; `n/a` if the counters are unavailable.
+
+### Windows status sampling
+
+For Windows, `status` launches one PowerShell sample per VM and waits for
+completion, checking the PID every 100 ms rather than using the daemon's sampling
+interval. The wait budget is five seconds per VM; an in-flight agent RPC may add
+its one-second timeout. A valid sample shows `agent/balloon` or
+`agent/virtio-mem`. A failed or timed-out sample falls back to fresh balloon
+statistics, or reports `unavailable/read-only` when no other metrics are
+available. These failures are visible only with `--debug` for `status`.
+
+No second PowerShell process is launched after completion or failure. A timeout
+does not kill the guest process; its PID is retained for the lifetime of that
+CLI invocation, but is not shared with the daemon or subsequent invocations.
+Windows samples for `status` run concurrently in the existing pool, up to
+`general.agent_workers` at a time (4 by default). All agent tasks finish before
+hypervisor statistics, XML inspection and table rows are processed serially.
+Row order is unchanged. Up to the worker limit, slow Windows guests wait in
+parallel rather than adding their timeout budgets together; larger fleets
+are processed in batches.
+
+## Configuration
 
 The `default` section supplies values for every VM. A VM entry overrides those
 values. If `auto_reclaim` is omitted from both places, it defaults to `false`.
@@ -656,11 +618,12 @@ The first sample initializes the EWMA directly and has no derivative term.
 Elapsed time comes from successive guest-statistics `last_update` timestamps,
 not the polling interval, and is bounded below by one second. The derivative
 contribution cannot exceed the current absolute error in either direction.
-Duplicate samples are not processed again; missing
-or invalid statistics are skipped, and statistics older than 15 seconds or
-dated in the future produce a warning and are skipped. A backwards timestamp
-resets the filter. When a VM starts, only its own controller history is reset
-unless the reloaded configuration differs from the previous one. A configuration
+Duplicate samples are not processed again; missing or invalid statistics are
+skipped. Samples dated in the future, Linux or balloon samples older than 15
+seconds, and Windows agent samples older than
+`max(30, windows_agent_interval * 3)` seconds produce a warning and are skipped.
+A backwards timestamp resets the filter. When a VM starts, only its own
+controller history is reset unless the reloaded configuration differs from the previous one. A configuration
 change resets controller history for all VMs without itself discarding existing
 manual-increase grace periods. Defining or resuming a VM also resets its own
 controller history.
@@ -816,6 +779,90 @@ host memory data is unavailable or invalid, an error
 is logged and reclaim is disabled for that cycle. Guest growth remains enabled;
 the daemon retries host statistics on the next cycle.
 
+## Converting VM memory XML
+
+`libvirt-mem-convert` converts libvirt domain XML between `virtio-balloon` and
+`virtio-mem`. It can read and write XML files, or update a VM directly through
+`virsh`. The script requires Python 3.7 or later and uses the Python standard
+library to process XML. `virsh` is required only for direct VM operation.
+
+The conversion modes are:
+
+- `to-virtiomem`: sets a fixed base memory and configures a `virtio-mem` device,
+  NUMA topology, and maximum memory. The base defaults to `1GiB` and is rounded
+  down to a multiple of 2 MiB. The generated NUMA cell excludes vCPU IDs
+  explicitly marked `enabled='no'`. If NUMA cells already exist, the converter
+  preserves all but the first cell's memory allocation and assigns the
+  remaining base memory to the first cell. It rejects a base that leaves no
+  memory for that cell. By default, the balloon is disabled with
+  `model='none'`; `-k` (`--keep-balloon`) preserves its current model (or
+  creates a `virtio` balloon if one is absent).
+- `to-balloon`: removes `virtio-mem` devices and restores the VM's memory
+  configuration for `virtio-balloon`. When NUMA cells are present, their memory
+  defines the fixed base, so any virtio-mem capacity already included in the
+  top-level `<memory>` is not counted twice. If the balloon model is `none`,
+  it is changed to `virtio`.
+
+Convert an XML file and save the result:
+
+```bash
+libvirt-mem-convert to-virtiomem vm.xml vm-virtiomem.xml --base-memory 2GiB
+```
+
+With `to-virtiomem`, use `--initial-memory 3GiB` (or `-i 3GiB`) to start with
+3 GiB of total guest memory instead of the input XML's `<currentMemory>` (or
+`<memory>` if it is absent). The value must be between the fixed base and the
+selected maximum memory. If it is not a multiple of 2 MiB, the converter
+rounds it down and reports the requested and effective values on standard
+error. In this direction, the option requires a domain without a `virtio-mem`
+device.
+
+With `to-balloon`, `--initial-memory` sets `<currentMemory>` directly, without
+2 MiB rounding or changing the calculated `<memory>`. The value must be
+positive and no greater than the resulting `<memory>`.
+
+Use `--max-memory SIZE` (or `-m SIZE`) to override the maximum total guest
+memory in either direction. With `to-virtiomem`, it replaces the input
+`<memory>` as the maximum. The order of `--base-memory` and `--max-memory` on
+the command line does not matter: the converter rounds down the base first,
+then rounds down the capacity above that base to whole 2 MiB blocks. For
+example, with `--base-memory 1024M --max-memory 2049M`, the resulting
+`<maxMemory>` is 2048 MiB: 1024 MiB of base memory plus 1024 MiB of virtio-mem
+capacity. With `to-balloon`, `--max-memory` sets the output `<memory>` directly
+without rounding. If the initial memory would exceed the requested maximum,
+also specify a lower `--initial-memory`.
+
+To keep the existing balloon model during conversion:
+
+```bash
+libvirt-mem-convert to-virtiomem vm.xml vm-virtiomem.xml -k
+```
+
+The output XML is written atomically, so the input and output paths may be the
+same. Replacing an existing file preserves its permission bits; a new file
+uses the system's normal file creation permissions.
+
+Preview the changes without writing a file with `-n` (`--dry-run`).
+Use `-L` (`--color`) with `auto`, `always`, or `never`:
+
+```bash
+libvirt-mem-convert to-virtiomem vm.xml -n -L always
+```
+
+To update a VM directly with `-V` (`--vm`), it must be shut off, persistent,
+and have no snapshots. Preview first, then omit `-n` to apply the conversion.
+`--connect` optionally selects the libvirt URI (otherwise `virsh` uses its
+default):
+
+```bash
+libvirt-mem-convert to-virtiomem -V guest-a --base-memory 2GiB -n
+libvirt-mem-convert to-virtiomem --vm guest-a --base-memory 2GiB
+libvirt-mem-convert to-balloon --vm guest-a
+```
+
+Use `libvirt-mem-convert --help` for all options and `man 1 libvirt-mem-convert`
+for the manual.
+
 ## Shutdown
 
 SIGTERM (including `systemctl stop`) removes the polling timer, deregisters
@@ -832,19 +879,3 @@ domains, because lifecycle events may have been missed. The backoff resets
 after the first successful poll. A failure of the libvirt event loop itself is
 still fatal; the supplied systemd unit uses `Restart=always` to start a new
 process.
-
-# Installation
-
-Requires Python 3 and the `libvirt-python` bindings (for example, the
-`python3-libvirt` package on Debian/Ubuntu).
-`make install` also installs `libvirt-mem-convert` in `/usr/bin` and its manual
-page in `/usr/share/man/man1`. The converter requires Python 3.7 or later.
-`virsh` is needed only for direct VM operation.
-When upgrading from the previous command name, uninstall the previous version
-first to remove its executable and manual page; no compatibility alias is installed.
-
-```
-~# make install
-~# systemctl enable libvirt-autoreclaim
-~# systemctl start libvirt-autoreclaim
-```
