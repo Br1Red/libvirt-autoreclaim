@@ -26,10 +26,8 @@ RECONNECT_MAX_DELAY = 60
 GUEST_SWAP_EMERGENCY_KIB_PER_SEC = 10 * SZ_1MiB
 GUEST_SWAP_VETO_KIB_PER_SEC = 64
 GUEST_SWAP_VETO_MIN_DROP_KIB = 256
-GUEST_OS_RETRY_INTERVAL = 60
-WINDOWS_EXEC_RETRY_INTERVAL = 60
+AGENT_RETRY_INTERVAL = 60
 WINDOWS_STATUS_TIMEOUT = 5
-# Some QGA versions print PRId64 literally instead of the PID.
 GUEST_EXEC_PID_NOT_FOUND_PATTERN = re.compile(r"\bPID (?:-?\d+|lld|ld|I64d) does not exist$")
 GUEST_PSI_NOT_FOUND_PATTERN = re.compile(
     r"failed to open file '/proc/pressure/memory' \(mode: 'r'\): No such file or directory$")
@@ -298,7 +296,6 @@ class LibVirtAutoReclaim:
         return self.config.get("default", {})
 
     def _log_transient_error(self, name, category, level, message, *args):
-        # Log transient guest failures once per streak; repeats go to DEBUG.
         if self.agent_faults.get(name) != category:
             self.agent_faults[name] = category
             logging.log(level, message, *args)
@@ -355,9 +352,9 @@ class LibVirtAutoReclaim:
                 self._log_transient_error(
                     name, "os-info", self.agent_error_level,
                     "%s cannot identify guest OS; using balloon statistics and retrying "
-                    "in %s seconds: %s", name, GUEST_OS_RETRY_INTERVAL, error)
+                    "in %s seconds: %s", name, AGENT_RETRY_INTERVAL, error)
                 self.guest_os[name] = None
-                self.guest_os_retry_at[name] = now + GUEST_OS_RETRY_INTERVAL
+                self.guest_os_retry_at[name] = now + AGENT_RETRY_INTERVAL
         return self.guest_os[name]
 
     def _get_windows_guest_meminfo(self, dom):
@@ -444,8 +441,6 @@ class LibVirtAutoReclaim:
                         "%s Windows guest-exec PID %s is no longer registered; "
                         "clearing cached process and sample: %s", name, pid, error)
                 except (ImportError, libvirt.libvirtError, KeyError, TypeError, ValueError) as error:
-                    # If QGA stops responding (e.g. guest reboot), drop the pending PID
-                    # so polling can relaunch the command once the agent is back.
                     if isinstance(error, libvirt.libvirtError):
                         state.pop("pid", None)
                     self._log_transient_error(
@@ -464,15 +459,13 @@ class LibVirtAutoReclaim:
                     state.pop("retry_at", None)
                     state.update(pid=result["pid"], started_at=now, started_wall=int(time()))
                 except (ImportError, libvirt.libvirtError, ValueError) as error:
-                    # Transient QGA failures (agent restarting, reboot, timeout) must not
-                    # disable guest-exec permanently; retry after a backoff instead.
-                    state["retry_at"] = monotonic() + WINDOWS_EXEC_RETRY_INTERVAL
+                    state["retry_at"] = monotonic() + AGENT_RETRY_INTERVAL
                     state["next_check"] = state["retry_at"]
                     self._log_transient_error(
                         name, "win-exec-start", error_level,
                         "%s cannot start Windows guest-exec; using cached or "
                         "balloon statistics and retrying in %s seconds: %s",
-                        name, WINDOWS_EXEC_RETRY_INTERVAL, error)
+                        name, AGENT_RETRY_INTERVAL, error)
         sample = state.get("sample")
         if sample is not None and 0 <= now - sample["sampled_at"] <= windows_sample_max_age:
             return sample
@@ -1077,7 +1070,6 @@ class LibVirtAutoReclaim:
                 for name, future in futures:
                     guest_samples[name] = future.result()
             finally:
-                # Drain workers before any connection cleanup or other domain RPCs.
                 for _, future in futures:
                     future.cancel()
                 wait([future for _, future in futures])
@@ -1285,8 +1277,6 @@ class LibVirtAutoReclaim:
                 self.__forget_domain(name)
             elif event == libvirt.VIR_DOMAIN_EVENT_STARTED:
                 self.guest_psi_unavailable.discard(name)
-                # A preceding refresh may already have scheduled an OS retry;
-                # keep its fault state so the retry does not log a duplicate warning.
                 if name not in self.guest_os or self.agent_faults.get(name) != "os-info":
                     self.agent_faults.pop(name, None)
                 if self.guest_os.get(name) is not None:
@@ -1492,7 +1482,6 @@ def dom_virtio_mem(dom, target_total_kb, actual_total_kb, *, minimum_ram_kb=0):
         new_total_requested += aligned_requested
     new_total_ram = base_ram_kb + new_total_requested
     if new_total_ram < minimum_ram_kb:
-        # Rounding to the nearest blocks must not lower a guest-backed floor.
         for index, (device, requested_kb) in enumerate(updates):
             block = device["block_kb"]
             if requested_kb + block <= device["size_kb"]:
@@ -1556,7 +1545,6 @@ def report_libvirt_error(context, error):
                      or (isinstance(message, str)
                          and (GUEST_EXEC_PID_NOT_FOUND_PATTERN.search(message)
                               or GUEST_PSI_NOT_FOUND_PATTERN.search(message)))))):
-        # Domain and guest-agent callers already report the handled exception.
         return
     log = logging.warning if level == libvirt.VIR_ERR_WARNING else logging.error
     name = LIBVIRT_ERROR_DOMAIN.get()

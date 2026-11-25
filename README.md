@@ -798,24 +798,47 @@ library to process XML. `virsh` is required only for direct VM operation.
 The conversion modes are:
 
 - `to-virtiomem`: sets a fixed base memory and configures a `virtio-mem` device,
-  NUMA topology, and maximum memory. The base defaults to `1GiB` and is rounded
+  NUMA topology, and maximum memory. The base defaults to `2GiB` and is rounded
   down to a multiple of 2 MiB. The generated NUMA cell excludes vCPU IDs
   explicitly marked `enabled='no'`. If NUMA cells already exist, the converter
   preserves all but the first cell's memory allocation and assigns the
   remaining base memory to the first cell. It rejects a base that leaves no
   memory for that cell. By default, the balloon is disabled with
   `model='none'`; `-k` (`--keep-balloon`) preserves its current model (or
-  creates a `virtio` balloon if one is absent).
+  creates a `virtio` balloon if one is absent). If the domain already has a
+  `virtio-mem` device and its base differs from the selected base, the
+  converter adjusts it and recalculates the device's capacity and requested
+  memory. The existing base is the sum of NUMA cell memory, or `<memory>` when
+  no NUMA cells exist.
 - `to-balloon`: removes `virtio-mem` devices and restores the VM's memory
   configuration for `virtio-balloon`. When NUMA cells are present, their memory
   defines the fixed base, so any virtio-mem capacity already included in the
   top-level `<memory>` is not counted twice. If the balloon model is `none`,
   it is changed to `virtio`.
 
+The mode can be omitted to preserve the existing configuration and correct only
+memory values. The converter detects `virtio-mem` in the input XML; otherwise it
+uses balloon-style memory fields, leaving devices and balloon settings
+unchanged. In this mode, `--initial-memory` and `--max-memory` update the
+corresponding memory values. `--base-memory` applies only to an existing
+`virtio-mem` domain and is rounded down to a multiple of 2 MiB. If omitted,
+an existing `virtio-mem` base is corrected to the default `2GiB` when needed.
+The existing total maximum and initial memory are preserved where possible;
+the initial memory cannot be below the new base. Device capacity and requested
+memory are rounded down to its configured block size (2 MiB if unspecified).
+The converter reports an error if the requested base cannot fit.
+
 Convert an XML file and save the result:
 
 ```bash
 libvirt-mem-convert to-virtiomem vm.xml vm-virtiomem.xml --base-memory 2GiB
+```
+
+For example, omit the conversion mode to keep the current mode while correcting
+memory values:
+
+```bash
+libvirt-mem-convert vm.xml vm-corrected.xml --initial-memory 3GiB --max-memory 6GiB
 ```
 
 With `to-virtiomem`, use `--initial-memory 3GiB` (or `-i 3GiB`) to start with

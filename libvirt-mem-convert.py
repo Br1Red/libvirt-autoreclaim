@@ -13,7 +13,7 @@ import tempfile
 import xml.etree.ElementTree as ET
 from typing import Dict, List, Optional, Tuple, Union
 
-DEFAULT_BASE_KIB = 1048576  # 1 GiB
+DEFAULT_BASE_KIB = 2097152  # 2 GiB
 BLOCK_KIB = 2048            # 2 MiB
 
 ANSI_RESET = '\033[0m'
@@ -279,6 +279,15 @@ def has_virtiomem(devices_el: Optional[ET.Element]) -> bool:
         return False
     return any(dev.get('model') == 'virtio-mem' for dev in devices_el.findall('memory'))
 
+def get_virtiomem_base_kib(root: ET.Element) -> int:
+    mem_el = root.find('memory')
+    if mem_el is None:
+        raise ValueError('The <memory> element is missing from the XML file.')
+    numa_cells = root.findall('cpu/numa/cell')
+    if numa_cells:
+        return sum(to_kib(cell.get('memory'), cell.get('unit')) for cell in numa_cells)
+    return to_kib(mem_el.text, mem_el.get('unit'))
+
 def configure_virtiomem_balloon(devices_el: ET.Element, keep_balloon: bool) -> None:
     balloon_el = devices_el.find('memballoon')
     if balloon_el is None:
@@ -310,6 +319,11 @@ def convert_to_virtiomem(
             raise ValueError('--max-memory requires a domain without a virtio-mem device in to-virtiomem.')
         if initial_kib is not None:
             raise ValueError('--initial-memory requires a domain without a virtio-mem device.')
+        base_aligned = align_down(base_kib, BLOCK_KIB)
+        if base_aligned <= 0:
+            raise ValueError('Base memory must be at least 2 MiB (2048 KiB).')
+        if get_virtiomem_base_kib(root) != base_aligned:
+            correct_memory_values(root, base_kib=base_kib)
         if devices_el is None:
             devices_el = add_child_formatted(root, 'devices', indent_level=1)
         configure_virtiomem_balloon(devices_el, keep_balloon)
@@ -505,6 +519,131 @@ def resize_first_numa_cell(cells: List[ET.Element], total_kib: int) -> None:
     cells[0].set('memory', str(remaining_kib))
     cells[0].set('unit', 'KiB')
 
+def correct_memory_values(
+    root: ET.Element,
+    base_kib: Optional[int] = None,
+    initial_kib: Optional[int] = None,
+    max_override_kib: Optional[int] = None,
+) -> None:
+    devices_el = root.find('devices')
+    with_virtiomem = has_virtiomem(devices_el)
+    if with_virtiomem and base_kib is None and get_virtiomem_base_kib(root) != DEFAULT_BASE_KIB:
+        base_kib = DEFAULT_BASE_KIB
+    if base_kib is None and initial_kib is None and max_override_kib is None:
+        return
+    mem_el = root.find('memory')
+    if mem_el is None:
+        raise ValueError('The <memory> element is missing from the XML file.')
+
+    if not with_virtiomem:
+        if base_kib is not None:
+            raise ValueError('--base-memory only applies to a domain using virtio-mem when no conversion mode is specified.')
+        if max_override_kib is not None and max_override_kib <= 0:
+            raise ValueError('Maximum memory must be positive.')
+        current_max_kib = to_kib(mem_el.text, mem_el.get('unit'))
+        new_max_kib = max_override_kib if max_override_kib is not None else current_max_kib
+        current_el = root.find('currentMemory')
+        current_kib = to_kib(current_el.text, current_el.get('unit')) if current_el is not None else current_max_kib
+        if initial_kib is None and current_kib > new_max_kib:
+            raise ValueError('Existing <currentMemory> exceeds --max-memory; specify --initial-memory.')
+        if max_override_kib is not None:
+            cells = root.findall('cpu/numa/cell')
+            if cells:
+                resize_first_numa_cell(cells, new_max_kib)
+            mem_el.set('unit', 'KiB')
+            mem_el.text = str(new_max_kib)
+        if initial_kib is not None:
+            set_balloon_current_memory(root, initial_kib, new_max_kib)
+        return
+
+    vmem_devices = [
+        dev for dev in devices_el.findall('memory') if dev.get('model') == 'virtio-mem'
+    ]
+    if len(vmem_devices) != 1:
+        raise ValueError('Memory-only correction requires exactly one virtio-mem device.')
+
+    numa_cells = root.findall('cpu/numa/cell')
+    old_memory_kib = to_kib(mem_el.text, mem_el.get('unit'))
+    old_base_kib = get_virtiomem_base_kib(root)
+    max_mem_el = root.find('maxMemory')
+    dev = vmem_devices[0]
+    target_el = dev.find('target')
+    size_el = target_el.find('size') if target_el is not None else None
+    requested_el = target_el.find('requested') if target_el is not None else None
+    if size_el is None or requested_el is None:
+        raise ValueError('The virtio-mem target must contain <size> and <requested> elements.')
+    block_el = target_el.find('block')
+    block_kib = to_kib(block_el.text, block_el.get('unit')) if block_el is not None else BLOCK_KIB
+    if block_kib <= 0:
+        raise ValueError('The virtio-mem block size must be positive.')
+
+    old_size_kib = to_kib(size_el.text, size_el.get('unit'))
+    old_requested_kib = to_kib(requested_el.text, requested_el.get('unit'))
+    old_max_kib = (
+        to_kib(max_mem_el.text, max_mem_el.get('unit'))
+        if max_mem_el is not None and max_mem_el.text
+        else old_base_kib + old_size_kib
+    )
+    memory_tracks_base = old_memory_kib == old_base_kib
+    memory_tracks_max = old_memory_kib == old_max_kib
+    old_current_kib = old_base_kib + old_requested_kib
+    new_base_kib = align_down(base_kib, BLOCK_KIB) if base_kib is not None else old_base_kib
+    if new_base_kib <= 0:
+        raise ValueError('Base memory must be at least 2 MiB (2048 KiB).')
+    requested_max_kib = max_override_kib if max_override_kib is not None else old_max_kib
+    if requested_max_kib <= new_base_kib:
+        raise ValueError(
+            f'Maximum VM memory ({requested_max_kib} KiB) must be greater than base memory ({new_base_kib} KiB).'
+        )
+    new_size_kib = align_down(requested_max_kib - new_base_kib, block_kib)
+    if new_size_kib <= 0:
+        raise ValueError(f'Maximum memory must leave at least one {block_kib} KiB block above the fixed base.')
+    new_max_kib = new_base_kib + new_size_kib
+
+    current_total_kib = (
+        initial_kib if initial_kib is not None else max(new_base_kib, old_current_kib)
+    )
+    if not new_base_kib <= current_total_kib <= new_max_kib:
+        raise ValueError(
+            f'Initial memory must be between base memory ({new_base_kib} KiB) '
+            f'and maximum VM memory ({new_max_kib} KiB).'
+        )
+    requested_total_kib = align_down(current_total_kib - new_base_kib, block_kib)
+    if initial_kib is not None:
+        effective_initial_kib = new_base_kib + requested_total_kib
+        if effective_initial_kib != initial_kib:
+            print(
+                f'Warning: --initial-memory rounded down from {initial_kib} KiB to '
+                f'{effective_initial_kib} KiB to align with {block_kib} KiB blocks.',
+                file=sys.stderr,
+            )
+
+    current_el = root.find('currentMemory')
+    if current_el is None:
+        add_child_formatted(
+            root, 'currentMemory', attrib={'unit': 'KiB'}, text=str(new_base_kib), indent_level=1
+        )
+    else:
+        current_el.set('unit', 'KiB')
+        current_el.text = str(new_base_kib)
+    if base_kib is not None and memory_tracks_base:
+        mem_el.set('unit', 'KiB')
+        mem_el.text = str(new_base_kib)
+    if base_kib is not None and numa_cells:
+        resize_first_numa_cell(numa_cells, new_base_kib)
+    if base_kib is not None or max_override_kib is not None:
+        size_el.set('unit', 'KiB')
+        size_el.text = str(new_size_kib)
+        if max_override_kib is not None:
+            if memory_tracks_max:
+                mem_el.set('unit', 'KiB')
+                mem_el.text = str(new_max_kib)
+        if max_mem_el is not None and max_override_kib is not None:
+            max_mem_el.set('unit', 'KiB')
+            max_mem_el.text = str(new_max_kib)
+    requested_el.set('unit', 'KiB')
+    requested_el.text = str(requested_total_kib)
+
 class DomainTreeBuilder(ET.TreeBuilder):
     # Python 3.7 has no TreeBuilder insert_comments or insert_pis options.
     _depth = 0
@@ -542,8 +681,8 @@ def format_libvirt_style(xml_str: str) -> str:
 
 def transform_xml_string(
     xml_content: str,
-    mode: str,
-    base_kib: int,
+    mode: Optional[str],
+    base_kib: Optional[int],
     keep_balloon: bool = False,
     initial_kib: Optional[int] = None,
     max_override_kib: Optional[int] = None,
@@ -552,9 +691,14 @@ def transform_xml_string(
         if prefix and prefix != 'xml' and not re.fullmatch(r'ns\d+', prefix):
             ET.register_namespace(prefix, uri)
     root = ET.fromstring(xml_content, parser=ET.XMLParser(target=DomainTreeBuilder()))
-    if mode == 'to-virtiomem':
+    if mode is None:
+        correct_memory_values(
+            root, base_kib=base_kib, initial_kib=initial_kib, max_override_kib=max_override_kib
+        )
+    elif mode == 'to-virtiomem':
         convert_to_virtiomem(
-            root, base_kib=base_kib, keep_balloon=keep_balloon, initial_kib=initial_kib,
+            root, base_kib=base_kib if base_kib is not None else DEFAULT_BASE_KIB,
+            keep_balloon=keep_balloon, initial_kib=initial_kib,
             max_override_kib=max_override_kib,
         )
     else:
@@ -609,8 +753,8 @@ def write_xml_atomically(path: str, content: str) -> None:
 
 def process_vm(
     vm_name: str,
-    mode: str,
-    base_kib: int,
+    mode: Optional[str],
+    base_kib: Optional[int],
     connect_uri: Optional[str] = None,
     dry_run: bool = False,
     color_mode: str = 'auto',
@@ -619,7 +763,7 @@ def process_vm(
     max_override_kib: Optional[int] = None,
 ):
     state = run_virsh(['domstate', vm_name], connect_uri).strip().lower()
-    if state != 'shut off':
+    if state != 'shut off' and not dry_run:
         raise RuntimeError(
             f"VM '{vm_name}' is in state '{state}'. It must be shut off before proceeding."
         )
@@ -651,7 +795,10 @@ def process_vm(
             tmp.write(new_xml)
             tmp_path = tmp.name
         run_virsh(['define', tmp_path], connect_uri)
-        print(f"VM '{vm_name}' successfully updated using mode [{mode}].")
+        if mode is None:
+            print(f"VM '{vm_name}' memory values updated; existing mode preserved.")
+        else:
+            print(f"VM '{vm_name}' successfully updated using mode [{mode}].")
     finally:
         if tmp_path and os.path.exists(tmp_path):
             os.remove(tmp_path)
@@ -660,9 +807,10 @@ def main():
     parser = argparse.ArgumentParser(
         prog='libvirt-mem-convert',
         description='Convert libvirt XML between virtio-balloon and virtio-mem.')
-    parser.add_argument('mode', choices=['to-virtiomem', 'to-balloon'], help='Conversion direction')
-    parser.add_argument('input_xml', nargs='?', help='Path to the input XML file (unless --vm is used)')
-    parser.add_argument('output_xml', nargs='?', help='Path to the output XML file (not needed with --vm or --dry-run)')
+    parser.add_argument(
+        'positionals', nargs='*', metavar='MODE_OR_INPUT',
+        help='Optional conversion mode, followed by input and output XML paths',
+    )
     parser.add_argument(
         '-c', '--connect',
         metavar='URI',
@@ -675,8 +823,7 @@ def main():
     )
     parser.add_argument(
         '-b', '--base-memory',
-        default='1GiB',
-        help='Minimum guaranteed base memory (e.g. 1G, 1536M, 2GiB). Default: 1GiB',
+        help='Minimum guaranteed base memory (e.g. 1G, 1536M, 2GiB). Default: 2GiB for conversion',
     )
     parser.add_argument(
         '-i', '--initial-memory',
@@ -705,18 +852,30 @@ def main():
         help='Control diff output colors (default: auto)',
     )
     args = parser.parse_args()
-    if args.keep_balloon and args.mode != 'to-virtiomem':
+    mode = None
+    paths = args.positionals
+    if paths and paths[0] in ('to-virtiomem', 'to-balloon'):
+        mode = paths.pop(0)
+    if len(paths) > 2:
+        parser.error('Specify at most an input_xml and output_xml.')
+    input_xml = paths[0] if paths else None
+    output_xml = paths[1] if len(paths) > 1 else None
+    if args.keep_balloon and mode != 'to-virtiomem':
         parser.error('--keep-balloon can only be used with to-virtiomem.')
     try:
-        base_kib = parse_memory_size(args.base_memory)
+        base_kib = (
+            parse_memory_size(args.base_memory)
+            if args.base_memory is not None
+            else (None if mode is None else DEFAULT_BASE_KIB)
+        )
         initial_kib = parse_memory_size(args.initial_memory) if args.initial_memory is not None else None
         max_override_kib = parse_memory_size(args.max_memory) if args.max_memory is not None else None
         if args.vm:
-            if args.input_xml or args.output_xml:
+            if input_xml or output_xml:
                 parser.error('Do not specify positional XML files when using --vm.')
             process_vm(
                 args.vm,
-                args.mode,
+                mode,
                 base_kib,
                 connect_uri=args.connect,
                 dry_run=args.dry_run,
@@ -726,21 +885,24 @@ def main():
                 max_override_kib=max_override_kib,
             )
         else:
-            if not args.input_xml:
+            if not input_xml:
                 parser.error('Specify input_xml or use --vm VM_NAME.')
-            if not args.dry_run and not args.output_xml:
+            if not args.dry_run and not output_xml:
                 parser.error('Specify output_xml, or use --dry-run to preview changes without saving.')
-            with open(args.input_xml, 'r', encoding='utf-8') as f:
+            with open(input_xml, 'r', encoding='utf-8') as f:
                 orig_xml = f.read()
             new_xml = transform_xml_string(
-                orig_xml, args.mode, base_kib, keep_balloon=args.keep_balloon, initial_kib=initial_kib,
+                orig_xml, mode, base_kib, keep_balloon=args.keep_balloon, initial_kib=initial_kib,
                 max_override_kib=max_override_kib,
             )
             if args.dry_run:
-                print_diff(orig_xml, new_xml, args.input_xml, color_mode=args.color)
+                print_diff(orig_xml, new_xml, input_xml, color_mode=args.color)
             else:
-                write_xml_atomically(args.output_xml, new_xml)
-                print(f'Conversion [{args.mode}] completed successfully -> {args.output_xml}')
+                write_xml_atomically(output_xml, new_xml)
+                if mode is None:
+                    print(f'Memory values corrected, existing mode preserved -> {output_xml}')
+                else:
+                    print(f'Conversion [{mode}] completed successfully -> {output_xml}')
     except Exception as e:
         print(f'Error: {e}', file=sys.stderr)
         sys.exit(1)

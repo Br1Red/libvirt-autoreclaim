@@ -62,9 +62,11 @@ class LibvirtMemConvertTests(unittest.TestCase):
         self.assertEqual(balloon.find('stats').get('period'), '5')
 
     def test_idempotent_to_virtiomem_disables_existing_balloon(self):
-        xml = """<domain>
-  <memory unit='KiB'>4194304</memory>
-  <currentMemory unit='KiB'>1048576</currentMemory>
+        base_kib = libvirt_mem_convert.DEFAULT_BASE_KIB
+        xml = f"""<domain>
+  <memory unit='KiB'>8388608</memory>
+  <currentMemory unit='KiB'>{base_kib}</currentMemory>
+  <cpu><numa><cell id='0' cpus='0-3' memory='{base_kib}' unit='KiB'/></numa></cpu>
   <devices>
     <memory model='virtio-mem'>
       <target><size unit='KiB'>2048</size><requested unit='KiB'>0</requested></target>
@@ -73,11 +75,118 @@ class LibvirtMemConvertTests(unittest.TestCase):
   </devices>
 </domain>"""
 
-        result = libvirt_mem_convert.transform_xml_string(xml, 'to-virtiomem', 1048576)
+        result = libvirt_mem_convert.transform_xml_string(xml, 'to-virtiomem', base_kib)
         root = ElementTree.fromstring(result)
 
         self.assertEqual(len(root.findall("devices/memory[@model='virtio-mem']")), 1)
         self.assertEqual(root.find('devices/memballoon').get('model'), 'none')
+
+    def test_existing_virtiomem_base_is_corrected_to_default(self):
+        xml = """<domain>
+  <maxMemory slots='16' unit='GiB'>8</maxMemory>
+  <memory unit='GiB'>8</memory>
+  <currentMemory unit='GiB'>1</currentMemory>
+  <cpu><numa><cell id='0' cpus='0-3' memory='1' unit='GiB'/></numa></cpu>
+  <devices><memory model='virtio-mem'><target>
+    <size unit='GiB'>7</size><requested unit='MiB'>1536</requested>
+  </target></memory><memballoon model='none'/></devices>
+</domain>"""
+        for mode in (None, 'to-virtiomem'):
+            with self.subTest(mode=mode):
+                result = libvirt_mem_convert.transform_xml_string(xml, mode, base_kib=None)
+                root = ElementTree.fromstring(result)
+                self.assertEqual(root.findtext('memory'), '8')
+                self.assertEqual(root.findtext('maxMemory'), '8')
+                self.assertEqual(root.findtext('currentMemory'), '2097152')
+                self.assertEqual(root.find('cpu/numa/cell').get('memory'), '2097152')
+                self.assertEqual(root.findtext('devices/memory/target/size'), '6291456')
+                self.assertEqual(root.findtext('devices/memory/target/requested'), '524288')
+                self.assertEqual(root.find('devices/memballoon').get('model'), 'none')
+
+    def test_default_base_correction_rejects_insufficient_maximum(self):
+        xml = (
+            "<domain><memory unit='MiB'>512</memory><currentMemory unit='MiB'>512</currentMemory>"
+            "<devices><memory model='virtio-mem'><target><size unit='MiB'>1024</size>"
+            "<requested unit='MiB'>0</requested></target></memory></devices></domain>"
+        )
+        for mode in (None, 'to-virtiomem'):
+            with self.subTest(mode=mode), self.assertRaisesRegex(
+                ValueError, 'Maximum VM memory .* must be greater than base memory'
+            ):
+                libvirt_mem_convert.transform_xml_string(xml, mode, base_kib=None)
+
+    def test_default_base_correction_preserves_secondary_numa_cells(self):
+        xml = (
+            "<domain><maxMemory unit='GiB'>8</maxMemory><memory unit='GiB'>8</memory>"
+            "<currentMemory unit='GiB'>4</currentMemory><cpu><numa>"
+            "<cell id='0' memory='3584' unit='MiB'/><cell id='1' memory='512' unit='MiB'/>"
+            "</numa></cpu><devices><memory model='virtio-mem'><target>"
+            "<size unit='GiB'>4</size><requested unit='GiB'>1</requested>"
+            "</target></memory></devices></domain>"
+        )
+        root = ElementTree.fromstring(
+            libvirt_mem_convert.transform_xml_string(xml, None, base_kib=None)
+        )
+
+        cells = root.findall('cpu/numa/cell')
+        self.assertEqual(cells[0].get('memory'), str(1536 * 1024))
+        self.assertEqual(cells[1].get('memory'), '512')
+        self.assertEqual(cells[1].get('unit'), 'MiB')
+        self.assertEqual(root.findtext('memory'), '8')
+        self.assertEqual(root.findtext('devices/memory/target/size'), str(6 * 1048576))
+        self.assertEqual(root.findtext('devices/memory/target/requested'), str(3 * 1048576))
+
+    def test_default_base_correction_applies_initial_and_max_overrides(self):
+        xml = (
+            "<domain><maxMemory unit='GiB'>8</maxMemory><memory unit='GiB'>8</memory>"
+            "<currentMemory unit='GiB'>1</currentMemory><cpu><numa>"
+            "<cell id='0' memory='1' unit='GiB'/></numa></cpu><devices>"
+            "<memory model='virtio-mem'><target><size unit='GiB'>7</size>"
+            "<requested unit='GiB'>1</requested></target></memory></devices></domain>"
+        )
+        root = ElementTree.fromstring(libvirt_mem_convert.transform_xml_string(
+            xml, None, base_kib=None, initial_kib=3 * 1048576,
+            max_override_kib=6 * 1048576,
+        ))
+
+        self.assertEqual(root.findtext('maxMemory'), str(6 * 1048576))
+        self.assertEqual(root.findtext('memory'), str(6 * 1048576))
+        self.assertEqual(root.findtext('currentMemory'), str(2 * 1048576))
+        self.assertEqual(root.findtext('devices/memory/target/size'), str(4 * 1048576))
+        self.assertEqual(root.findtext('devices/memory/target/requested'), str(1048576))
+
+    def test_base_correction_respects_existing_virtiomem_block_size(self):
+        xml = (
+            "<domain><maxMemory unit='GiB'>4</maxMemory><memory unit='GiB'>1</memory>"
+            "<currentMemory unit='GiB'>1</currentMemory><devices>"
+            "<memory model='virtio-mem'><target><size unit='GiB'>3</size>"
+            "<block unit='MiB'>128</block><requested unit='GiB'>1</requested>"
+            "</target></memory></devices></domain>"
+        )
+        result = libvirt_mem_convert.transform_xml_string(xml, None, base_kib=1026 * 1024)
+        root = ElementTree.fromstring(result)
+
+        self.assertEqual(root.findtext('memory'), str(1026 * 1024))
+        self.assertEqual(root.findtext('devices/memory/target/size'), str(2944 * 1024))
+        self.assertEqual(root.findtext('devices/memory/target/requested'), str(896 * 1024))
+
+    def test_vm_dry_run_corrects_default_base_without_defining_domain(self):
+        xml = (
+            "<domain><memory unit='GiB'>1</memory><currentMemory unit='GiB'>1</currentMemory>"
+            "<devices><memory model='virtio-mem'><target><size unit='GiB'>3</size>"
+            "<requested unit='GiB'>1</requested></target></memory></devices></domain>"
+        )
+        with patch.object(
+            libvirt_mem_convert, 'run_virsh',
+            side_effect=['running', 'Persistent: yes\n', '', xml],
+        ) as run_virsh, patch.object(libvirt_mem_convert, 'print_diff') as print_diff:
+            libvirt_mem_convert.process_vm('guest-a', None, None, dry_run=True)
+
+        self.assertEqual(len(run_virsh.call_args_list), 4)
+        root = ElementTree.fromstring(print_diff.call_args.args[1])
+        self.assertEqual(root.findtext('memory'), '2097152')
+        self.assertEqual(root.findtext('devices/memory/target/size'), '2097152')
+        self.assertEqual(root.findtext('devices/memory/target/requested'), '0')
 
     def test_to_virtiomem_creates_requested_balloon_model_when_missing(self):
         xml = (
@@ -212,7 +321,7 @@ class LibvirtMemConvertTests(unittest.TestCase):
         process_vm.assert_called_once_with(
             'guest-a',
             'to-virtiomem',
-            1048576,
+            libvirt_mem_convert.DEFAULT_BASE_KIB,
             connect_uri=None,
             dry_run=True,
             color_mode='always',
@@ -220,6 +329,140 @@ class LibvirtMemConvertTests(unittest.TestCase):
             initial_kib=2097152,
             max_override_kib=6291456,
         )
+
+    def test_omitted_mode_preserves_virtiomem_and_corrects_memory_values(self):
+        xml = """<domain>
+  <maxMemory slots='16' unit='GiB'>4</maxMemory>
+  <memory unit='GiB'>4</memory>
+  <currentMemory unit='GiB'>1</currentMemory>
+  <cpu><numa><cell id='0' cpus='0-1' memory='1' unit='GiB'/></numa></cpu>
+  <devices>
+    <memory model='virtio-mem'>
+      <target><size unit='GiB'>3</size><requested unit='GiB'>1</requested></target>
+    </memory>
+    <memballoon model='none'/>
+  </devices>
+</domain>"""
+
+        result = libvirt_mem_convert.transform_xml_string(
+            xml, None, base_kib=2 * 1048576, initial_kib=3 * 1048576,
+            max_override_kib=5 * 1048576,
+        )
+        root = ElementTree.fromstring(result)
+
+        self.assertEqual(root.findtext('memory'), str(5 * 1048576))
+        self.assertEqual(root.findtext('currentMemory'), str(2 * 1048576))
+        self.assertEqual(root.findtext('maxMemory'), str(5 * 1048576))
+        self.assertEqual(root.find('cpu/numa/cell').get('memory'), str(2 * 1048576))
+        self.assertEqual(root.findtext('devices/memory/target/size'), str(3 * 1048576))
+        self.assertEqual(root.findtext('devices/memory/target/requested'), str(1048576))
+        self.assertEqual(root.find('devices/memballoon').get('model'), 'none')
+
+    def test_omitted_mode_keeps_memory_equal_to_max_memory(self):
+        xml = """<domain>
+  <maxMemory slots='16' unit='KiB'>8388608</maxMemory>
+  <memory unit='KiB'>8388608</memory>
+  <currentMemory unit='KiB'>1048576</currentMemory>
+  <cpu><numa><cell id='0' cpus='0-3' memory='1048576' unit='KiB'/></numa></cpu>
+  <devices><memory model='virtio-mem'><target>
+    <size unit='KiB'>7340032</size><requested unit='KiB'>1572864</requested>
+  </target></memory></devices>
+</domain>"""
+        result = libvirt_mem_convert.transform_xml_string(
+            xml, None, base_kib=2 * 1048576
+        )
+        root = ElementTree.fromstring(result)
+
+        self.assertEqual(root.findtext('memory'), root.findtext('maxMemory'))
+        self.assertEqual(root.findtext('memory'), '8388608')
+        self.assertEqual(root.findtext('currentMemory'), '2097152')
+        self.assertEqual(root.find('cpu/numa/cell').get('memory'), '2097152')
+        self.assertEqual(root.findtext('devices/memory/target/size'), '6291456')
+        self.assertEqual(root.findtext('devices/memory/target/requested'), '524288')
+
+    def test_omitted_mode_preserves_balloon_device_while_correcting_memory(self):
+        xml = (
+            "<domain><memory unit='GiB'>4</memory><currentMemory unit='GiB'>2</currentMemory>"
+            "<devices><memballoon model='none'/></devices></domain>"
+        )
+        result = libvirt_mem_convert.transform_xml_string(
+            xml, None, base_kib=None, initial_kib=1048576, max_override_kib=3 * 1048576
+        )
+        root = ElementTree.fromstring(result)
+
+        self.assertEqual(root.findtext('memory'), str(3 * 1048576))
+        self.assertEqual(root.findtext('currentMemory'), str(1048576))
+        self.assertEqual(root.find('devices/memballoon').get('model'), 'none')
+        self.assertIsNone(root.find('maxMemory'))
+        self.assertIsNone(root.find("devices/memory[@model='virtio-mem']"))
+
+    def test_omitted_mode_base_can_raise_current_virtiomem_memory(self):
+        xml = (
+            "<domain><maxMemory unit='GiB'>4</maxMemory><memory unit='GiB'>1</memory>"
+            "<currentMemory unit='GiB'>1</currentMemory><devices><memory model='virtio-mem'>"
+            "<target><size unit='GiB'>3</size><requested unit='GiB'>0</requested></target>"
+            "</memory></devices></domain>"
+        )
+        result = libvirt_mem_convert.transform_xml_string(
+            xml, None, base_kib=2 * 1048576
+        )
+        root = ElementTree.fromstring(result)
+
+        self.assertEqual(root.findtext('memory'), str(2 * 1048576))
+        self.assertEqual(root.findtext('currentMemory'), str(2 * 1048576))
+        self.assertEqual(root.findtext('maxMemory'), '4')
+        self.assertEqual(root.findtext('devices/memory/target/size'), str(2 * 1048576))
+        self.assertEqual(root.findtext('devices/memory/target/requested'), '0')
+
+    def test_cli_omitted_mode_accepts_input_and_output_paths(self):
+        xml = (
+            "<domain><memory unit='GiB'>4</memory><currentMemory unit='GiB'>2</currentMemory>"
+            "<devices><memballoon model='none'/></devices></domain>"
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            input_path = os.path.join(directory, 'input.xml')
+            output_path = os.path.join(directory, 'output.xml')
+            with open(input_path, 'w', encoding='utf-8') as xml_file:
+                xml_file.write(xml)
+
+            with patch(
+                'sys.argv',
+                ['libvirt-mem-convert.py', input_path, output_path, '--initial-memory', '1GiB'],
+            ):
+                libvirt_mem_convert.main()
+
+            root = ElementTree.parse(output_path).getroot()
+            self.assertEqual(root.findtext('currentMemory'), str(1048576))
+            self.assertEqual(root.find('devices/memballoon').get('model'), 'none')
+
+    def test_cli_omitted_mode_checks_default_base_without_replacing_it(self):
+        xml = (
+            "<domain><maxMemory unit='MiB'>4096</maxMemory><memory unit='MiB'>2048</memory>"
+            "<currentMemory unit='MiB'>2048</currentMemory><devices>"
+            "<memory model='virtio-mem'><target><size unit='MiB'>2048</size>"
+            "<requested unit='MiB'>0</requested></target></memory>"
+            "<memballoon model='none'/></devices></domain>"
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            input_path = os.path.join(directory, 'input.xml')
+            output_path = os.path.join(directory, 'output.xml')
+            with open(input_path, 'w', encoding='utf-8') as xml_file:
+                xml_file.write(xml)
+
+            with patch(
+                'sys.argv',
+                [
+                    'libvirt-mem-convert.py', input_path, output_path,
+                    '--initial-memory', '3GiB',
+                ],
+            ):
+                libvirt_mem_convert.main()
+
+            root = ElementTree.parse(output_path).getroot()
+            self.assertEqual(root.findtext('memory'), '2048')
+            self.assertEqual(root.findtext('currentMemory'), '2097152')
+            self.assertEqual(root.findtext('devices/memory/target/requested'), '1048576')
+            self.assertEqual(root.find('devices/memballoon').get('model'), 'none')
 
     def test_max_memory_overrides_capacity_in_both_directions(self):
         xml = (
@@ -479,6 +722,44 @@ class LibvirtMemConvertTests(unittest.TestCase):
             run_virsh.call_args_list,
             [call(['domstate', 'guest-a'], None), call(['dominfo', 'guest-a'], None)],
         )
+
+    def test_process_vm_dry_run_allows_active_persistent_domain(self):
+        with patch.object(
+            libvirt_mem_convert,
+            'run_virsh',
+            side_effect=['running', 'Name: guest-a\nPersistent: yes\n', '', '<domain/>'],
+        ) as run_virsh, patch.object(
+            libvirt_mem_convert, 'transform_xml_string', return_value='<domain/>'
+        ), patch.object(libvirt_mem_convert, 'print_diff') as print_diff:
+            libvirt_mem_convert.process_vm('guest-a', 'to-virtiomem', 1048576, dry_run=True)
+
+        self.assertEqual(len(run_virsh.call_args_list), 4)
+        self.assertEqual(run_virsh.call_args_list[-1], call(['dumpxml', '--inactive', 'guest-a'], None))
+        print_diff.assert_called_once()
+
+    def test_process_vm_dry_run_keeps_persistence_and_snapshot_checks(self):
+        for responses, message in (
+            (['running', 'Name: guest-a\nPersistent: no\n'], 'not persistent'),
+            (['running', 'Name: guest-a\nPersistent: yes\n', 'snapshot-a\n'], 'has snapshots'),
+        ):
+            with self.subTest(message=message):
+                with patch.object(
+                    libvirt_mem_convert, 'run_virsh', side_effect=responses
+                ) as run_virsh:
+                    with self.assertRaisesRegex(RuntimeError, message):
+                        libvirt_mem_convert.process_vm(
+                            'guest-a', 'to-virtiomem', 1048576, dry_run=True
+                        )
+                self.assertEqual(len(run_virsh.call_args_list), len(responses))
+
+    def test_process_vm_still_requires_shutdown_without_dry_run(self):
+        with patch.object(
+            libvirt_mem_convert, 'run_virsh', return_value='running'
+        ) as run_virsh:
+            with self.assertRaisesRegex(RuntimeError, 'must be shut off'):
+                libvirt_mem_convert.process_vm('guest-a', 'to-virtiomem', 1048576)
+
+        run_virsh.assert_called_once_with(['domstate', 'guest-a'], None)
 
     def test_process_vm_rejects_domains_with_snapshots(self):
         with patch.object(

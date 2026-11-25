@@ -18,7 +18,7 @@ libvirt-mem-convert \- convert libvirt domain XML configurations between virtio-
 .RB [ \-n ]
 .RB [ \-L
 .IR WHEN ]
-.I mode
+.RI [ mode ]
 .RI [ input_xml ]
 .RI [ output_xml ]
 .SH DESCRIPTION
@@ -37,7 +37,9 @@ option is specified. All transformations are idempotent: running the command mul
 .SH POSITIONAL ARGUMENTS
 .TP
 .I mode
-Conversion direction. Must be one of:
+Optional conversion direction. If omitted, preserve the current memory mode
+and update memory values without changing the devices or balloon settings.
+If specified, must be one of:
 .RS
 .TP
 .B to\-virtiomem
@@ -85,11 +87,14 @@ Name of the libvirt virtual machine to modify directly via
 .BR virsh (1).
 The virtual machine must be in the
 .B shut off
-state, be persistent, and have no snapshots before running the command.
+state unless
+.B \-\-dry\-run
+is used. The domain must be persistent and have no snapshots in either case.
 .TP
 .BI \-b " SIZE" "\fR,\fP \-\-base\-memory " SIZE
 Minimum guaranteed static base memory when converting with
-.BR to\-virtiomem .
+.BR to\-virtiomem ,
+or updating an existing virtio-mem domain without a conversion mode.
 Accepts human-readable suffixes such as
 .BR 1G ,
 .BR 1536M ,
@@ -97,7 +102,10 @@ Accepts human-readable suffixes such as
 or raw integer values in KiB. The value is rounded down to a multiple of
 .B 2 MiB
 (2048 KiB). Defaults to
-.BR 1GiB .
+.BR 2GiB
+for virtio-mem. An existing virtio-mem base is corrected if it differs;
+device capacity and requested memory are adjusted using its block size.
+The maximum and initial total memory are preserved where possible.
 .TP
 .BI \-i " SIZE" "\fR,\fP \-\-initial\-memory " SIZE
 Initial total guest memory. Uses the same units as
