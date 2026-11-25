@@ -68,15 +68,15 @@ virtio-mem guests.
 
 A VM without a balloon device is also monitored when its XML defines both a
 SPICE channel (`type='spicevmc'`) and the `org.qemu.guest_agent.0` Unix
-channel. In this case, the VM appears as `read-only` in `status`, which reads its
-memory statistics from the agent. The daemon does not poll it, adjust its
-memory, or include it when choosing the polling interval.
+channel. In this case, the VM appears as `read-only` in the cached status.
+The daemon does not poll it, adjust its memory, or include it when choosing
+the polling interval, so its status values are unavailable.
 
 ## Guest memory statistics
 
 ### Guest Agent and OS identification
 
-For memory control and `status`, the daemon identifies the guest OS once per
+For memory control, the daemon identifies the guest OS once per
 VM start with QEMU Guest Agent `guest-get-osinfo`. With `--debug`, it logs the
 guest name, detected OS ID and backend OS classification. If identification fails, it
 logs a warning once per VM, uses balloon statistics and silently retries identification
@@ -132,7 +132,7 @@ reflect file-backed reads, so this is a conservative paging heuristic.
   subject to the static floor, maximum RAM and alignment. This conservative
   estimate can protect recoverable cache and stop reclaim above the reserve.
 - Guest PSI, Windows Pages/sec and pagefile allocation/usage are unavailable.
-  `status` therefore shows `n/a` for `PSI` and `Swap_Used`. Optional balloon
+  The status table therefore shows `n/a` for `PSI` and `Swap_Used`. Optional balloon
   `swap_out` and `major_fault` deltas can veto reclaim, but do not provide
   current swap occupancy or trigger paging-based emergency growth.
 - If those optional counters are missing, the daemon has no guest paging
@@ -183,7 +183,7 @@ pagefile-bearing logical disks. Without a pagefile, it uses the system drive.
 The estimates are rounded to two decimal places and capped at 100%; when no
 matching disk counters are available, a 2 ms latency is assumed. These are
 Windows pressure heuristics, not measurements equivalent to Linux PSI.
-The controller applies the same PSI thresholds to these estimates, and `status`
+The controller applies the same PSI thresholds to these estimates, and the status table
 shows `psi_some` in its `PSI` column. The controller uses hypervisor allocation
 (`memoryStats().actual` for balloon, fixed RAM plus plugged devices for
 virtio-mem) rather than Windows `TotalVisibleMemorySize` for `Actual` and target
@@ -274,29 +274,43 @@ repeat these messages for unchanged VMs.
 
 ## Command line and status
 
-The configuration file defaults to `/etc/libvirt/autoreclaim.json`. Select a
-different file with `-c` or `--config`:
+Run `libvirt-autoreclaim` (or `./libvirt-autoreclaim.py` from the source
+directory) to start the daemon. The configuration file defaults to
+`/etc/libvirt/autoreclaim.json`. Select a different file with `-c` or `--config`:
 
 ```
-libvirt-autoreclaim --config /path/to/autoreclaim.json start
-libvirt-autoreclaim -c /path/to/autoreclaim.json status
+libvirt-autoreclaim --config /path/to/autoreclaim.json
 ```
 
-`status` displays an aligned table of active monitored VMs, including `Backend`,
+Use `--debug` to enable debug logging at startup. Send `SIGUSR2` to toggle
+debug logging on or off while the daemon is running; the new state is logged:
+
+```bash
+systemctl kill --signal=SIGUSR2 --kill-whom=main libvirt-autoreclaim
+```
+
+Send `SIGUSR1` to the running daemon to print a cached status table to its
+standard output (the journal with the supplied systemd service):
+
+```bash
+systemctl kill --signal=SIGUSR1 --kill-whom=main libvirt-autoreclaim
+```
+
+The table displays monitored VMs in alphabetical order, ignoring case, including `Backend`,
 memory values in MiB, and the effective memory weight. `Backend` combines the
 statistics source (`agent`, `balloon`, or `unavailable`) and the memory method
 (`balloon`, `virtio-mem`, or `read-only`) as `source/method`. For example,
 `agent/virtio-mem` uses QEMU Guest Agent statistics and adjusts memory via
 virtio-mem. `balloon/balloon` is displayed simply as `balloon`. Column
-widths adapt to domain names and values. Connection, configuration-loading,
-and monitoring messages are hidden by default. Guest Agent unavailability,
-timeouts, command failures (including missing guest files) and OS identification
-failures are reported only with `--debug` for `status`. The `start` command
-retains its warnings for OS identification and Windows guest-exec failures.
-If no other statistics are
-available, `Backend` uses `unavailable` as the source. Other warnings and
-errors remain visible on standard error. The `start` command logs daemon events
-and memory adjustments to standard error; the `status` table uses standard output.
+widths adapt to domain names and values. If no statistics are available,
+`Backend` uses `unavailable` as the source. The daemon logs events and memory
+adjustments to standard error; the status table uses standard output.
+
+This does not query libvirt or the guests. It displays the latest valid samples
+collected during normal polling, which can be stale; `Age_s` is the age in
+seconds of the underlying sample. Fields without a sample show `n/a`, including
+read-only VMs, which the daemon does not poll. PSI is the last value obtained
+when normal control logic queried it and can be older than the memory sample.
 If a VM stops between active-domain enumeration and lookup, polling logs a
 single warning and skips it without a duplicate libvirt error.
 Informational messages have no level prefix; other log levels retain their
@@ -313,30 +327,10 @@ source from the memory adjustment mechanism. `guest-agent` is displayed as
   when actual and usable memory are available, including balloon samples.
   This is a reclaim limit, not a growth target; read-only VMs show `n/a`.
 - `PSI`: Linux guest memory `some avg10`, or the Windows `psi_some` estimate,
-  reported as a percentage. `status` shows `n/a` if unavailable. This does not
+  reported as a percentage. The table shows `n/a` if unavailable. This does not
   change PSI polling in the daemon.
 - `Swap_Used`: guest `SwapTotal - SwapFree` in MiB, or Windows pagefile usage,
   from the guest sample; `n/a` if the counters are unavailable.
-
-### Windows status sampling
-
-For Windows, `status` launches one PowerShell sample per VM and waits for
-completion, checking the PID every 100 ms rather than using the daemon's sampling
-interval. The wait budget is five seconds per VM; an in-flight agent RPC may add
-its one-second timeout. A valid sample shows `agent/balloon` or
-`agent/virtio-mem`. A failed or timed-out sample falls back to fresh balloon
-statistics, or reports `unavailable/read-only` when no other metrics are
-available. These failures are visible only with `--debug` for `status`.
-
-No second PowerShell process is launched after completion or failure. A timeout
-does not kill the guest process; its PID is retained for the lifetime of that
-CLI invocation, but is not shared with the daemon or subsequent invocations.
-Windows samples for `status` run concurrently in the existing pool, up to
-`general.agent_workers` at a time (4 by default). All agent tasks finish before
-hypervisor statistics, XML inspection and table rows are processed serially.
-Row order is unchanged. Up to the worker limit, slow Windows guests wait in
-parallel rather than adding their timeout budgets together; larger fleets
-are processed in batches.
 
 ## Configuration
 
@@ -588,11 +582,11 @@ periods on heavily overcommitted hosts unless sufficient host headroom exists.
 
 ### 5. Verify the result under load
 
-Use `libvirt-autoreclaim status` to inspect `Actual`, `Usable`, `Keep_Usable`,
-and `Weight`. Observe host `MemAvailable` and `/proc/pressure/memory` alongside
-guest swap activity, disk I/O, and application latency. Enable `--debug` on
-the existing daemon invocation when investigating controller decisions; do not
-run a second daemon against the same guests.
+Send `SIGUSR1` to inspect `Actual`, `Usable`, `Keep_Usable`, and `Weight` in
+the daemon's cached status. Observe host `MemAvailable` and `/proc/pressure/memory` alongside
+guest swap activity, disk I/O, and application latency. Send `SIGUSR2` to the
+running daemon to toggle debug logging when investigating controller decisions;
+do not run a second daemon against the same guests.
 
 Compare `Usable` with `Keep_Usable`, rather than relying on the ratio of
 `Actual` to `Keep_Usable`: allocated RAM alone does not show guest headroom.
@@ -636,7 +630,7 @@ controller history is reset unless the reloaded configuration differs from the p
 change resets controller history for all VMs without itself discarding existing
 manual-increase grace periods. Defining or resuming a VM also resets its own
 controller history.
-The status command's `Keep_Usable` column shows the effective reserve.
+The status table's `Keep_Usable` column shows the effective reserve.
 Its `Weight` column shows the effective `memory_weight`, including inheritance
 from `default` or the built-in default of 100. Higher weights mean higher
 priority when protecting memory from reclaim; the weight is dimensionless.

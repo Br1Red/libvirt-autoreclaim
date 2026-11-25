@@ -5,7 +5,7 @@ ConditionPathExists=/etc/libvirt/autoreclaim.json
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/libvirt-autoreclaim start
+ExecStart=/usr/bin/libvirt-autoreclaim
 Nice=19
 SuccessExitStatus=143
 OOMScoreAdjust=-999

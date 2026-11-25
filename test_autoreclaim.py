@@ -175,6 +175,12 @@ class AdaptiveControllerTests(unittest.TestCase):
         self.controller.pending_targets = {}
         self.controller.manual_increase_until = {}
         self.controller.control_samples = {}
+        self.controller.status_samples = {}
+        self.controller.status_psi = {}
+        self.controller.status_requests = 0
+        self.controller.status_processed = 0
+        self.controller.debug_requests = 0
+        self.controller.debug_processed = 0
         self.controller.agent_executor = autoreclaim.ThreadPoolExecutor(max_workers=4)
         self.addCleanup(self.controller.agent_executor.shutdown, wait=True)
         self.domain = Domain()
@@ -189,188 +195,85 @@ class AdaptiveControllerTests(unittest.TestCase):
         self.domain.updated = self.now
         self.controller.process_domainID(self.domain, pressure)
 
-    def test_status_shows_effective_memory_weight(self):
-        for default_weight, vm_weight, expected in (
-                (None, None, 100), (500, None, 500), (500, 200, 200)):
-            with self.subTest(default_weight=default_weight, vm_weight=vm_weight):
-                self.controller.config["default"] = (
-                    {} if default_weight is None else {"memory_weight": default_weight})
-                vm = self.controller.config["vms"][0]
-                if vm_weight is None:
-                    vm.pop("memory_weight", None)
-                else:
-                    vm["memory_weight"] = vm_weight
-                self.controller.conn = Mock()
-                self.controller.conn.listDomainsID.return_value = [1]
-                self.controller.conn.lookupByID.return_value = self.domain
-                output = io.StringIO()
-                with patch.object(self.controller, "dom_print_names"), redirect_stdout(output):
-                    self.controller.status()
-                self.assertEqual([line.split() for line in output.getvalue().splitlines()], [
-                    ["Domain", "Backend", "Total", "Actual", "Used",
-                     "Usable", "Keep_Usable", "Weight", "Floor", "PSI", "Swap_Used"],
-                    ["guest-a", "balloon", "8192", "1024", "512", "512", "512",
-                     str(expected), "1137", "n/a", "n/a"],
-                ])
-
-    def test_status_combines_statistics_source_and_memory_method(self):
+    def test_cached_status_uses_poll_sample_without_querying_domains(self):
         self.controller.conn = Mock()
         self.controller.conn.listDomainsID.return_value = [1]
         self.controller.conn.lookupByID.return_value = self.domain
+        self.controller.read_only_vms.add("read-only")
+        self.controller.monitored_vms.add("read-only")
+        self.controller.vm_backends["read-only"] = {"type": "balloon"}
+        self.domain.updated = self.now
+        with patch.object(self.controller, "host_memory_pressure", return_value=0):
+            self.controller.process_domains()
+        self.now += 3
+        self.controller.conn.reset_mock()
+        with patch.object(self.controller, "_get_domain_memstats", side_effect=AssertionError), \
+                patch.object(self.controller, "_get_guest_agent_memory_pressure", side_effect=AssertionError), \
+                patch.object(self.controller, "_memory_bounds", side_effect=AssertionError), \
+                redirect_stdout(io.StringIO()) as output:
+            self.controller.cached_status()
 
-        for backend, read_only, stats_source, expected_backend in (
-                ("balloon", False, "balloon", "balloon"),
-                ("balloon", False, "guest-agent", "agent/balloon"),
-                ("agent", False, "guest-agent", "agent"),
-                ("virtio-mem", False, "guest-agent", "agent/virtio-mem"),
-                ("balloon", True, "guest-agent", "agent/read-only"),
-                ("balloon", True, "unavailable", "unavailable/read-only")):
-            with self.subTest(backend=backend, read_only=read_only, source=stats_source):
-                self.controller.vm_backends["guest-a"] = {"type": backend}
-                if read_only:
-                    self.controller.read_only_vms.add("guest-a")
-                else:
-                    self.controller.read_only_vms.discard("guest-a")
-                with patch.object(self.controller, "_get_domain_memstats", return_value={
-                        "actual": self.domain.memory,
-                        "usable": self.domain.usable,
-                        "source": stats_source}):
-                    output = io.StringIO()
-                    with patch.object(self.controller, "dom_print_names"), \
-                            patch.object(self.controller, "_inspect_virtio_mem_devices", return_value=None), \
-                            patch.object(self.controller, "_get_guest_agent_memory_pressure",
-                                         return_value=(None, None)), redirect_stdout(output):
-                        self.controller.status()
+        self.controller.conn.assert_not_called()
+        self.assertEqual(self.controller.conn.mock_calls, [])
+        lines = [line.split() for line in output.getvalue().splitlines()]
+        self.assertEqual(lines[1][-1], "Age_s")
+        self.assertEqual(lines[2][:6], ["guest-a", "balloon", "8192", "1024", "512", "512"])
+        self.assertEqual(lines[2][-1], "3")
+        self.assertEqual(lines[3][0:2], ["read-only", "unavailable/read-only"])
+        self.assertEqual(lines[3][-1], "n/a")
 
-                row = output.getvalue().splitlines()[1].split()
-                self.assertEqual(row[1], expected_backend)
+    def test_cached_status_sorts_names_case_insensitively(self):
+        self.controller.monitored_vms.update(("zulu", "Bravo", "alpha", "ALPHA"))
+        self.controller.read_only_vms.add("Bravo")
+        self.domain.updated = self.now
+        with patch.object(autoreclaim, "dom_balloon"), redirect_stdout(io.StringIO()) as output:
+            self.controller.process_domainID(self.domain, 0)
+            self.controller.cached_status()
+        names = [line.split()[0] for line in output.getvalue().splitlines()[2:]]
+        self.assertEqual(names, ["ALPHA", "alpha", "Bravo", "guest-a", "zulu"])
 
-    def test_status_aligns_columns_for_long_names_and_large_numbers(self):
-        long_domain = Domain("Windows11Professional-Lavoro")
-        long_domain.maximum = 1048576 * 1024
-        self.controller.monitored_vms.add(long_domain.name())
-        self.controller.conn = Mock()
-        self.controller.conn.listDomainsID.return_value = [1, 2]
-        self.controller.conn.lookupByID.side_effect = [self.domain, long_domain]
-        output = io.StringIO()
-        with patch.object(self.controller, "dom_print_names"), redirect_stdout(output):
-            self.controller.status()
-        lines = output.getvalue().splitlines()
-        self.assertNotIn("\t", output.getvalue())
-        self.assertEqual(len(lines), 3)
-        self.assertEqual(lines[1].index("8192"), lines[2].index("1048576") + 3)
-        self.assertEqual(lines[0].index("Total") + 5, lines[2].index("1048576") + 7)
-        for line in lines[1:]:
-            self.assertTrue(line.endswith("n/a"))
-            self.assertEqual(len(line), len(lines[0]))
-        self.assertTrue(lines[2].startswith(long_domain.name() + "  "))
-
-    def test_status_with_no_active_domains_prints_only_header(self):
-        self.controller.conn = Mock()
-        self.controller.conn.listDomainsID.return_value = []
-        output = io.StringIO()
-        with patch.object(self.controller, "dom_print_names"), redirect_stdout(output):
-            self.controller.status()
-        self.assertEqual(len(output.getvalue().splitlines()), 1)
-        self.assertEqual(output.getvalue().split(), [
-            "Domain", "Backend", "Total", "Actual", "Used",
-            "Usable", "Keep_Usable", "Weight", "Floor", "PSI", "Swap_Used",
-        ])
-
-    def test_status_samples_windows_in_parallel_and_builds_rows_serially_in_order(self):
-        first, second = Domain("windows-first"), Domain("windows-second")
-        domains = [first, self.domain, second]
-        self.controller.monitored_vms.update((first.name(), second.name()))
-        for dom in (first, second):
-            self.controller.vm_backends[dom.name()] = {
-                "type": "balloon", "os": "windows", "has_guest_agent": True}
-        self.controller.conn = Mock()
-        self.controller.conn.listDomainsID.return_value = [1, 2, 3]
-        self.controller.conn.lookupByID.side_effect = lambda domain_id: domains[domain_id - 1]
-        main_thread = threading.get_ident()
-        barrier = threading.Barrier(2)
-        completed = {dom.name(): threading.Event() for dom in (first, second)}
-        original_sample = self.controller._get_domain_memstats
-
-        def windows_sample(dom):
-            self.assertNotEqual(threading.get_ident(), main_thread)
-            barrier.wait(timeout=1)
-            completed[dom.name()].set()
-            if dom is first:
-                return None
-            return {"actual": dom.memory, "usable": dom.usable, "source": "guest-agent"}
-
-        def domain_sample(dom, **kwargs):
-            self.assertEqual(threading.get_ident(), main_thread)
-            self.assertTrue(all(event.is_set() for event in completed.values()))
-            if dom is not self.domain:
-                self.assertFalse(kwargs["query_guest"])
-            return original_sample(dom, **kwargs)
-
-        output = io.StringIO()
-        with patch.object(self.controller, "dom_print_names"), \
-                patch.object(self.controller, "_get_windows_status_meminfo",
-                             side_effect=windows_sample) as agent, \
-                patch.object(self.controller, "_get_domain_memstats", side_effect=domain_sample), \
-                patch.object(autoreclaim, "ThreadPoolExecutor") as create_pool, \
-                redirect_stdout(output):
-            self.controller.status()
-        create_pool.assert_not_called()
-        self.assertEqual(agent.call_count, 2)
-        rows = [line.split() for line in output.getvalue().splitlines()[1:]]
-        self.assertEqual([row[0] for row in rows], [dom.name() for dom in domains])
-        self.assertEqual([row[1] for row in rows], ["balloon", "balloon", "agent/balloon"])
-
-    def test_status_drains_windows_workers_before_propagating_failure(self):
-        first, second = Domain("windows-first"), Domain("windows-second")
-        self.controller.monitored_vms.update((first.name(), second.name()))
-        for dom in (first, second):
-            self.controller.vm_backends[dom.name()] = {
-                "type": "balloon", "os": "windows", "has_guest_agent": True}
-        self.controller.conn = Mock()
-        self.controller.conn.listDomainsID.return_value = [1, 2]
-        self.controller.conn.lookupByID.side_effect = lambda domain_id: first if domain_id == 1 else second
-        barrier = threading.Barrier(2)
-        completed = threading.Event()
-
-        def sample(dom):
-            barrier.wait(timeout=1)
-            if dom is first:
-                raise ValueError("Unexpected sampling failure")
-            completed.set()
-            return None
-
-        with patch.object(self.controller, "dom_print_names"), \
-                patch.object(self.controller, "_get_windows_status_meminfo", side_effect=sample), \
-                patch.object(self.controller, "_get_domain_memstats") as domain_sample:
-            with self.assertRaisesRegex(ValueError, "Unexpected sampling failure"):
-                self.controller.status()
-        self.assertTrue(completed.is_set())
-        domain_sample.assert_not_called()
-
-    def test_status_shows_guest_reclaim_floor_psi_and_swap(self):
-        stats = {"actual": 4194304, "usable": 2097152, "source": "guest-agent",
-                 "anon_pages": 2097152, "active_file": 524288, "inactive_file": 1048576,
+    def test_cached_status_displays_processed_guest_values(self):
+        self.controller.config["default"]["memory_weight"] = 200
+        self.domain.memory, self.domain.usable = 4194304, 2097152
+        stats = {"actual": self.domain.memory, "usable": self.domain.usable,
+                 "last_update": self.now, "source": "guest-agent",
+                 "anon_pages": 2097152, "active_file": 524288,
                  "swap_total": 524288, "swap_free": 393216}
-        with patch.object(self.controller, "_get_domain_memstats", return_value=stats), \
-                patch.object(self.controller, "_read_guest_agent_file",
-                             return_value="some avg10=0.40\nfull avg10=0.01\n") as read_file:
-            row = self.controller.dom_status(self.domain)
-        read_file.assert_called_once_with(self.domain, "/proc/pressure/memory")
-        self.assertEqual(row[-3:], ("3413", "0.4%", "128"))
+        with patch.object(self.controller, "_get_guest_agent_memory_pressure",
+                          return_value=(0.4, 0.01)), \
+                patch.object(autoreclaim, "dom_balloon"), redirect_stdout(io.StringIO()) as output:
+            self.controller.process_domainID(self.domain, 1, stats)
+            self.controller.cached_status()
+        self.assertEqual(output.getvalue().splitlines()[2].split(), [
+            "guest-a", "agent/balloon", "8192", "4096", "2048", "2048",
+            "512", "200", "3413", "0.4%", "128", "0"])
 
-    def test_status_shows_virtio_mem_effective_floor_with_balloon_stats(self):
-        self.controller.vm_backends["guest-a"] = {"type": "virtio-mem"}
-        for usable, expected_floor in ((2097152, "2844"), (3145728, "2048")):
-            with self.subTest(usable=usable):
-                stats = {"actual": 4194304, "usable": usable, "source": "balloon"}
-                with patch.object(self.controller, "_get_domain_memstats", return_value=stats), \
-                        patch.object(self.controller, "_inspect_virtio_mem_devices", return_value={
-                            "base_ram_kb": 2097152, "max_ram_kb": 6291456}), \
-                        patch.object(self.controller, "_get_guest_agent_memory_pressure") as psi:
-                    row = self.controller.dom_status(self.domain)
-                psi.assert_not_called()
-                self.assertEqual(row[-3:], (expected_floor, "n/a", "n/a"))
+    def test_cached_status_displays_windows_pagefile_and_pressure(self):
+        self.controller.vm_backends["guest-a"] = {"type": "balloon", "os": "windows"}
+        stats = {"actual": 4194304, "usable": 2097152, "last_update": self.now,
+                 "sampled_at": self.now, "source": "guest-agent",
+                 "swap_total": 131072, "swap_free": 88064, "psi_some": 0.4}
+        with patch.object(self.controller, "_get_guest_agent_memory_pressure") as psi, \
+                patch.object(autoreclaim, "dom_balloon"), redirect_stdout(io.StringIO()) as output:
+            self.controller.process_domainID(self.domain, 1, stats)
+            self.controller.cached_status()
+        psi.assert_not_called()
+        self.assertEqual(output.getvalue().splitlines()[2].split()[-4:], ["2844", "0.4%", "42", "0"])
+
+    def test_read_only_guest_is_not_polled_for_cached_status(self):
+        self.controller.read_only_vms.add("guest-a")
+        self.controller.conn = Mock()
+        self.controller.conn.listDomainsID.return_value = [1]
+        self.controller.conn.lookupByID.return_value = self.domain
+        with patch.object(self.controller, "_get_guest_agent_meminfo") as sample, \
+                patch.object(self.controller, "host_memory_pressure") as pressure, \
+                redirect_stdout(io.StringIO()) as output:
+            self.controller.process_domains()
+            self.controller.cached_status()
+        sample.assert_not_called()
+        pressure.assert_not_called()
+        self.assertEqual(output.getvalue().splitlines()[2].split()[:2],
+                         ["guest-a", "unavailable/read-only"])
 
     def test_guest_agent_meminfo_reads_and_closes_guest_file(self):
         meminfo = ("MemTotal: 1048576 kB\nMemAvailable: 524288 kB\nAnonPages: 300000 kB\n"
@@ -548,7 +451,6 @@ class AdaptiveControllerTests(unittest.TestCase):
             self.assertIn("retrying in 60 seconds", logs.output[0])
             self.now = 159
             self.assertIsNone(self.controller._get_windows_guest_meminfo(self.domain))
-            self.assertIsNone(self.controller._get_windows_status_meminfo(self.domain))
             self.assertEqual(agent.call_count, 1)
             self.now = 160
             with self.assertNoLogs(level="WARNING"):
@@ -593,65 +495,6 @@ class AdaptiveControllerTests(unittest.TestCase):
         self.assertEqual(self.controller.windows_agent_state["guest-a"]["sample"]["usable"], 1048576)
         self.assertEqual(stats["actual"], 786432)
         self.assertEqual(stats["usable"], 786432)
-
-    def test_windows_status_waits_for_one_agent_sample_without_linux_procfs(self):
-        self.controller.windows_exec_enabled = False
-        self.controller.vm_backends["guest-a"] = {
-            "type": "balloon", "has_guest_agent": True, "os": "windows"}
-        agent = Mock(side_effect=[
-            json.dumps({"return": {"pid": 42}}),
-            json.dumps({"return": {"exited": True, "exitcode": 0, "out-data": base64.b64encode(
-                b"1048576|536870912|10485760|0|42|128|2097152|1048576|4194304|5242880|0|0").decode()}}),
-        ])
-        with patch.dict(sys.modules, {"libvirt_qemu": types.SimpleNamespace(qemuAgentCommand=agent)}), \
-                patch.object(autoreclaim, "sleep", side_effect=lambda delay: setattr(
-                    self, "now", self.now + delay)), \
-                patch.object(self.controller, "_read_guest_agent_file") as proc:
-            row = self.controller.dom_status(self.domain)
-        self.assertEqual(row[1], "agent/balloon")
-        self.assertEqual(row[-1], "42")
-        self.assertEqual([json.loads(call.args[1])["execute"] for call in agent.call_args_list],
-                         ["guest-exec", "guest-exec-status"])
-        self.assertFalse(self.controller.windows_exec_enabled)
-        proc.assert_not_called()
-
-    def test_windows_status_times_out_without_relaunching_guest_process(self):
-        self.controller.windows_exec_enabled = False
-        self.controller.vm_backends["guest-a"] = {
-            "type": "balloon", "has_guest_agent": True, "os": "windows"}
-        commands = []
-
-        def agent(_dom, raw, _timeout, _flags):
-            command = json.loads(raw)
-            commands.append(command["execute"])
-            return json.dumps({"return": {"pid": 42} if command["execute"] == "guest-exec"
-                               else {"exited": False}})
-
-        with patch.dict(sys.modules, {"libvirt_qemu": types.SimpleNamespace(qemuAgentCommand=agent)}), \
-                patch.object(autoreclaim, "sleep", side_effect=lambda delay: setattr(
-                    self, "now", self.now + delay)), self.assertLogs(level="DEBUG") as logs:
-            row = self.controller.dom_status(self.domain)
-        self.assertEqual(row[1], "balloon")
-        self.assertEqual(commands.count("guest-exec"), 1)
-        self.assertEqual(self.now, 105)
-        self.assertEqual(self.controller.windows_agent_state["guest-a"]["pid"], 42)
-        self.assertTrue(any("timed out after 5 seconds" in message for message in logs.output))
-
-    def test_windows_status_rejects_failed_sample_without_launching_another_process(self):
-        self.controller.windows_exec_enabled = False
-        self.controller.vm_backends["guest-a"] = {
-            "type": "balloon", "has_guest_agent": True, "os": "windows"}
-        agent = Mock(side_effect=[
-            json.dumps({"return": {"pid": 42}}),
-            json.dumps({"return": {"exited": True, "exitcode": 1}}),
-        ])
-        with patch.dict(sys.modules, {"libvirt_qemu": types.SimpleNamespace(qemuAgentCommand=agent)}), \
-                patch.object(autoreclaim, "sleep", side_effect=lambda delay: setattr(
-                    self, "now", self.now + delay)), self.assertLogs(level="DEBUG") as logs:
-            row = self.controller.dom_status(self.domain)
-        self.assertEqual(row[1], "balloon")
-        self.assertEqual(agent.call_count, 2)
-        self.assertTrue(any("PowerShell failed" in message for message in logs.output))
 
     def test_windows_agent_recovers_when_qga_forgets_exec_pid(self):
         for message, raw_error in (
@@ -921,16 +764,6 @@ class AdaptiveControllerTests(unittest.TestCase):
                     else:
                         self.assertGreater(adjust.call_args.args[1], 4194304)
 
-    def test_windows_cache_sets_guest_floor_and_pagefile_status(self):
-        self.controller.vm_backends["guest-a"] = {"type": "balloon", "os": "windows"}
-        stats = {"actual": 4194304, "usable": 2097152, "source": "guest-agent",
-                 "protected_cache_kb": 2097152, "standby_cache_kb": 1048576,
-                 "swap_total": 131072, "swap_free": 88064, "psi_some": 0.4}
-        with patch.object(self.controller, "_get_domain_memstats", return_value=stats), \
-                patch.object(self.controller, "_get_guest_agent_memory_pressure") as psi:
-            row = self.controller.dom_status(self.domain)
-        psi.assert_not_called()
-        self.assertEqual(row[-3:], ("2844", "0.4%", "42"))
 
     def test_windows_agent_psi_controls_emergency_growth_and_reclaim_veto(self):
         self.controller.vm_backends["guest-a"] = {"type": "balloon", "os": "windows"}
@@ -1333,21 +1166,6 @@ class AdaptiveControllerTests(unittest.TestCase):
         self.assertEqual(stats["usable"], 1572864)
         self.assertEqual(stats["source"], "guest-agent")
 
-    def test_virtio_mem_status_includes_base_ram_with_balloon_stats(self):
-        self.controller.vm_backends["guest-a"] = {"type": "virtio-mem"}
-        self.domain.XMLDesc = Mock(return_value=(
-            "<domain><memory unit='KiB'>8388608</memory>"
-            "<currentMemory unit='KiB'>4325376</currentMemory><devices>"
-            "<memory model='virtio-mem'><target>"
-            "<size unit='KiB'>7340032</size><requested unit='KiB'>3407872</requested>"
-            "<current unit='KiB'>3276800</current>"
-            "</target></memory></devices></domain>"))
-        with patch.object(self.domain, "memoryStats", return_value={
-                "actual": 4325376, "usable": 2602964, "last_update": self.now}):
-            row = self.controller.dom_status(self.domain)
-
-        self.assertEqual(row[:6], (
-            "guest-a", "balloon/virtio-mem", "8192", "4224", "1682", "2541"))
 
     def test_read_only_guest_agent_monitoring_does_not_change_memory(self):
         self.controller.read_only_vms.add("guest-a")
@@ -1381,18 +1199,6 @@ class AdaptiveControllerTests(unittest.TestCase):
         get_stats.assert_called_once_with(self.domain)
         memory_stats.assert_not_called()
 
-    def test_status_combines_balloon_allocation_with_fresh_guest_agent_stats(self):
-        self.controller.guest_agents.add("guest-a")
-        guest_stats = {"actual": 983040, "usable": 393216, "last_update": self.now,
-                       "source": "guest-agent"}
-        with patch.object(self.controller, "_get_guest_agent_meminfo", return_value=guest_stats), \
-                patch.object(self.controller, "_get_guest_agent_memory_pressure", return_value=(None, None)), \
-                patch.object(self.domain, "memoryStats", return_value={
-                    "actual": self.domain.memory, "usable": 10, "last_update": 0}) as balloon:
-            row = self.controller.dom_status(self.domain)
-
-        balloon.assert_called_once_with()
-        self.assertEqual(row[:6], ("guest-a", "agent/balloon", "8192", "1024", "640", "384"))
 
     def test_guest_agent_open_failure_falls_back_to_balloon_without_retrying_psi(self):
         self.controller.guest_agents.add("guest-a")
@@ -2153,29 +1959,6 @@ class AdaptiveControllerTests(unittest.TestCase):
             self.controller.process_domains()
             self.assertEqual(sample.call_count, 2)
 
-    def test_read_only_guest_is_sampled_by_status_but_not_by_polling(self):
-        self.controller.read_only_vms.add("guest-a")
-        self.controller.conn = Mock()
-        self.controller.conn.listDomainsID.return_value = [1]
-        self.controller.conn.lookupByID.return_value = self.domain
-        stats = {"actual": self.domain.memory, "usable": self.domain.usable,
-                 "source": "guest-agent"}
-        output = io.StringIO()
-        with patch.object(self.controller, "_get_guest_agent_meminfo", return_value=stats) as sample, \
-                patch.object(self.controller, "host_memory_pressure") as pressure, \
-                patch.object(self.controller, "process_domainID") as process, \
-                patch.object(self.controller, "dom_print_names"), \
-                patch.object(self.controller, "_get_guest_agent_memory_pressure", return_value=(None, None)), \
-                redirect_stdout(output):
-            self.controller.process_domains()
-            sample.assert_not_called()
-            pressure.assert_not_called()
-            process.assert_not_called()
-            self.controller.status()
-
-        sample.assert_called_once_with(self.domain)
-        self.assertEqual(output.getvalue().splitlines()[1].split()[:2],
-                         ["guest-a", "agent/read-only"])
 
     def test_poll_prioritizes_yield_score_and_leaves_zero_idle_last(self):
         secondary = Domain("secondary")
@@ -2308,6 +2091,7 @@ class LifecycleTests(unittest.TestCase):
             VIR_DOMAIN_EVENT_STOPPED=5,
             VIR_DOMAIN_EVENT_CRASHED=8,
             VIR_DOMAIN_EVENT_ID_LIFECYCLE=0,
+            VIR_EVENT_HANDLE_READABLE=1,
             VIR_ERR_NO_DOMAIN=42,
             VIR_ERR_AGENT_UNRESPONSIVE=86,
             VIR_ERR_AGENT_COMMAND_TIMEOUT=112,
@@ -2319,6 +2103,8 @@ class LifecycleTests(unittest.TestCase):
             virEventAddTimeout=Mock(return_value=7),
             virEventUpdateTimeout=Mock(),
             virEventRemoveTimeout=Mock(),
+            virEventAddHandle=Mock(return_value=8),
+            virEventRemoveHandle=Mock(),
             virEventRunDefaultImpl=Mock(),
         )
         libvirt_patch = patch.object(autoreclaim, "libvirt", self.libvirt)
@@ -2373,134 +2159,26 @@ class LifecycleTests(unittest.TestCase):
                 executor.assert_called_once_with(max_workers=expected, thread_name_prefix="guest-agent")
                 controller.agent_executor.shutdown(wait=True)
 
-    def test_status_cli_only_prints_table_even_with_excluded_domains(self):
-        self.domain.info.return_value = (1, 8388608, 1048576, 1, 0)
-        self.domain.memoryStats.return_value = {"actual": 1048576, "usable": 524288}
-        excluded = Mock()
-        excluded.name.return_value = "excluded"
-        self.config_open.return_value.read.return_value = (
-            '{"default": {"auto_reclaim": true}, '
-            '"vms": [{"name": "excluded", "auto_reclaim": false}]}')
-        self.conn.listAllDomains.return_value = [self.domain, excluded]
-        self.conn.listDomainsID.return_value = [1]
-        self.conn.lookupByID.return_value = self.domain
-        for debug in (False, True):
-            with self.subTest(debug=debug):
-                output, errors = io.StringIO(), io.StringIO()
-                root = autoreclaim.logging.getLogger()
-                previous_level = root.level
-                try:
-                    with patch.object(root, "handlers", []):
-                        with redirect_stdout(output), redirect_stderr(errors):
-                            autoreclaim.libvirt_autoreclaim(
-                                ["libvirt-autoreclaim"] + (["--debug"] if debug else []) + ["status"])
-                finally:
-                    root.setLevel(previous_level)
-                self.assertEqual(len(output.getvalue().splitlines()), 2)
-                self.assertEqual(output.getvalue().splitlines()[0].split()[0], "Domain")
-                if debug:
-                    self.assertIn("Connecting to libvirt at qemu:///system",
-                                  errors.getvalue().splitlines())
-                    self.assertIn("Monitoring guest-new", errors.getvalue().splitlines())
-                else:
-                    self.assertEqual(errors.getvalue(), "")
+    def test_cli_starts_daemon_without_action(self):
+        for options, config in (([], "/etc/libvirt/autoreclaim.json"),
+                                (["--debug", "--config", "/tmp/custom.json"], "/tmp/custom.json")):
+            with self.subTest(options=options):
+                controller = Mock(conn=None)
+                with patch.object(autoreclaim, "LibVirtAutoReclaim", return_value=controller) as factory:
+                    autoreclaim.libvirt_autoreclaim(["libvirt-autoreclaim", *options])
+                factory.assert_called_once_with(configfile=config)
+                controller.daemon.assert_called_once_with()
+                controller.agent_executor.shutdown.assert_called_once_with(wait=True)
 
-    def test_status_routes_monitoring_warnings_to_stderr(self):
-        self.domain.XMLDesc.return_value = "<domain/>"
-        self.conn.listDomainsID.return_value = [1]
-        self.conn.lookupByID.return_value = self.domain
-        output, errors = io.StringIO(), io.StringIO()
-        root = autoreclaim.logging.getLogger()
-        previous_level = root.level
-        try:
-            with patch.object(root, "handlers", []), \
-                    redirect_stdout(output), redirect_stderr(errors):
-                autoreclaim.libvirt_autoreclaim(["libvirt-autoreclaim", "status"])
-        finally:
-            root.setLevel(previous_level)
-        self.assertEqual(len(output.getvalue().splitlines()), 1)
-        self.assertTrue(output.getvalue().startswith("Domain"))
-        self.assertIn("WARNING Not monitoring guest-new: balloon device is missing or disabled",
-                      errors.getvalue())
-
-    def test_cli_hides_agent_unavailability_but_keeps_other_libvirt_errors(self):
-        self.domain.XMLDesc.return_value = (
-            "<domain><devices>"
-            "<channel type='spicevmc'/>"
-            "<channel type='unix'><target name='org.qemu.guest_agent.0'/></channel>"
-            "</devices></domain>")
-        self.domain.info.return_value = (1, 8388608, 1048576, 1, 0)
-        self.conn.listDomainsID.return_value = [1]
-        self.conn.lookupByID.return_value = self.domain
-
-        def qemu_agent_command(_domain, command, _timeout, _flags):
-            if json.loads(command)["execute"] == "guest-get-osinfo":
-                return '{"return": {"id": "linux"}}'
-            report = self.libvirt.registerErrorHandler.call_args
-            for code, message in ((55, "Unrelated libvirt failure"),
-                                  (agent_code, "Guest agent unavailable")):
-                if report is None:
-                    print(message, file=sys.stderr)
-                else:
-                    handler, context = report.args
-                    handler(context, (code, 10, message, 2, None, None, None, 0, 0))
-            raise self.libvirt.libvirtError("Guest agent unavailable")
-
-        qemu_module = types.SimpleNamespace(qemuAgentCommand=qemu_agent_command)
-        for agent_code in (86, 112, 113):
-            for action in ("start", "status"):
-                for debug in (False, True):
-                    with self.subTest(agent_code=agent_code, action=action, debug=debug):
-                        self.libvirt.registerErrorHandler.reset_mock()
-                        output, errors = io.StringIO(), io.StringIO()
-                        root = autoreclaim.logging.getLogger()
-                        previous_level = root.level
-                        try:
-                            with patch.dict(sys.modules, {"libvirt_qemu": qemu_module}), \
-                                    patch.object(root, "handlers", []), \
-                                    patch.object(autoreclaim.LibVirtAutoReclaim, "daemon",
-                                                 autospec=True,
-                                                 side_effect=lambda controller: controller.status()), \
-                                    redirect_stdout(output), redirect_stderr(errors):
-                                autoreclaim.libvirt_autoreclaim(
-                                    ["libvirt-autoreclaim"] + (["--debug"] if debug else []) + [action])
-                        finally:
-                            root.setLevel(previous_level)
-                        self.assertIn("unavailable/read-only", output.getvalue().splitlines()[1].split())
-                        self.assertIn("Unrelated libvirt failure", errors.getvalue())
-                        expected_messages = int(debug) + int(agent_code == 113 and action == "start")
-                        self.assertEqual(errors.getvalue().count("Guest agent unavailable"),
-                                         expected_messages)
-                        self.libvirt.registerErrorHandler.assert_called_with(None, None)
-
-    def test_status_hides_os_identification_failure_unless_debug_enabled(self):
-        self.domain.XMLDesc.return_value = (
-            "<domain><devices><memballoon autodeflate='on'><stats period='2'/></memballoon>"
-            "<channel type='unix'><target name='org.qemu.guest_agent.0'/></channel>"
-            "</devices></domain>")
-        self.domain.info.return_value = (1, 8388608, 1048576, 1, 0)
-        self.domain.memoryStats.return_value = {
-            "actual": 1048576, "usable": 524288, "last_update": 100}
-        self.conn.listDomainsID.return_value = [1]
-        self.conn.lookupByID.return_value = self.domain
-        self.qemu_agent.side_effect = self.libvirt.libvirtError("Guest agent unavailable")
-        for debug in (False, True):
-            with self.subTest(debug=debug):
-                output, errors = io.StringIO(), io.StringIO()
-                root = autoreclaim.logging.getLogger()
-                previous_level = root.level
-                try:
-                    with patch.object(root, "handlers", []), \
-                            patch.object(autoreclaim, "time", return_value=100), \
-                            redirect_stdout(output), redirect_stderr(errors):
-                        autoreclaim.libvirt_autoreclaim(
-                            ["libvirt-autoreclaim"] + (["--debug"] if debug else []) + ["status"])
-                finally:
-                    root.setLevel(previous_level)
-                self.assertIn("balloon", output.getvalue().splitlines()[1].split())
-                self.assertEqual("cannot identify guest OS" in errors.getvalue(), debug)
-                if not debug:
-                    self.assertEqual(errors.getvalue(), "")
+    def test_cli_rejects_removed_actions_without_connecting(self):
+        for action in ("start", "status"):
+            with self.subTest(action=action), \
+                    patch.object(autoreclaim, "LibVirtAutoReclaim") as controller, \
+                    redirect_stderr(io.StringIO()) as errors, self.assertRaises(SystemExit) as result:
+                autoreclaim.libvirt_autoreclaim(["libvirt-autoreclaim", action])
+            self.assertEqual(result.exception.code, 2)
+            self.assertIn(f"unrecognized arguments: {action}", errors.getvalue())
+            controller.assert_not_called()
 
     def test_libvirt_handler_hides_only_missing_guest_exec_pid_errors(self):
         for pid in ("42", "-1", "lld", "ld", "I64d"):
@@ -2821,6 +2499,8 @@ class LifecycleTests(unittest.TestCase):
                 self.controller.pending_targets["guest-new"] = (1048576, 100)
                 self.controller.manual_increase_until["guest-new"] = 3600
                 self.controller.control_samples["guest-new"] = autoreclaim.MemorySample(1, 1, 1, 100)
+                self.controller.status_samples["guest-new"] = (("old",), 100)
+                self.controller.status_psi["guest-new"] = 1.0
                 self.controller.guest_psi_unavailable.add("guest-new")
                 self.lifecycle(event)
                 self.assertNotIn("guest-new", self.controller.monitored_vms)
@@ -2828,6 +2508,8 @@ class LifecycleTests(unittest.TestCase):
                 self.assertNotIn("guest-new", self.controller.pending_targets)
                 self.assertNotIn("guest-new", self.controller.manual_increase_until)
                 self.assertNotIn("guest-new", self.controller.control_samples)
+                self.assertNotIn("guest-new", self.controller.status_samples)
+                self.assertNotIn("guest-new", self.controller.status_psi)
                 self.assertNotIn("guest-new", self.controller.guest_psi_unavailable)
                 self.controller.guest_psi_unavailable.add("guest-new")
                 self.lifecycle(self.libvirt.VIR_DOMAIN_EVENT_STARTED)
@@ -3205,6 +2887,134 @@ class LifecycleTests(unittest.TestCase):
         self.libvirt.virEventRemoveTimeout.assert_called_once_with(7)
         self.assertIsNone(self.controller.timer_id)
 
+    def test_sigusr1_prints_cached_status_without_polling(self):
+        self.conn.listDomainsID.return_value = [1]
+        self.conn.lookupByID.return_value = self.domain
+        self.domain.info.return_value = (1, 8388608, 1048576, 1, 0)
+        self.domain.memoryStats.return_value = {
+            "actual": 1048576, "usable": 524288, "last_update": 100}
+        output = io.StringIO()
+
+        def dispatch():
+            if self.libvirt.virEventRunDefaultImpl.call_count == 1:
+                self.conn.reset_mock()
+                self.domain.reset_mock()
+                autoreclaim.signal.getsignal(autoreclaim.signal.SIGUSR1)(
+                    autoreclaim.signal.SIGUSR1, None)
+                return 0
+            self.assertEqual(self.conn.mock_calls, [])
+            self.assertEqual(self.domain.mock_calls, [])
+            self.assertIn("guest-new", output.getvalue())
+            raise KeyboardInterrupt
+
+        self.libvirt.virEventRunDefaultImpl.side_effect = dispatch
+        old_handler = autoreclaim.signal.getsignal(autoreclaim.signal.SIGUSR1)
+        with patch.object(autoreclaim, "time", return_value=100), \
+                patch.object(self.controller, "host_memory_pressure", return_value=0), \
+                patch.object(autoreclaim, "dom_balloon"), redirect_stdout(output):
+            with self.assertRaises(KeyboardInterrupt):
+                self.controller.daemon()
+
+        self.assertIs(autoreclaim.signal.getsignal(autoreclaim.signal.SIGUSR1), old_handler)
+        self.libvirt.virEventRemoveHandle.assert_called_once_with(8)
+
+    def test_sigusr1_status_is_printed_during_reconnect_backoff(self):
+        read_fd, write_fd = autoreclaim.os.pipe2(autoreclaim.os.O_NONBLOCK | autoreclaim.os.O_CLOEXEC)
+        try:
+            def receive_signal(*_args):
+                autoreclaim.os.write(write_fd, b"x")
+                self.controller._LibVirtAutoReclaim__request_status(autoreclaim.signal.SIGUSR1, None)
+                return [read_fd], [], []
+
+            with patch.object(autoreclaim, "monotonic", side_effect=[100, 100, 101]), \
+                    patch.object(autoreclaim.select, "select", side_effect=receive_signal), \
+                    patch.object(self.controller, "cached_status") as status:
+                self.controller._LibVirtAutoReclaim__wait_reconnect(read_fd, 1)
+            status.assert_called_once_with()
+        finally:
+            autoreclaim.os.close(read_fd)
+            autoreclaim.os.close(write_fd)
+
+    def test_sigusr2_toggles_debug_while_idle_and_preserves_sigusr1(self):
+        self.conn.listAllDomains.return_value = []
+        logger = autoreclaim.logging.getLogger()
+        self.addCleanup(logger.setLevel, logger.level)
+        logger.setLevel(autoreclaim.logging.INFO)
+        old_handler = autoreclaim.signal.getsignal(autoreclaim.signal.SIGUSR2)
+        output = io.StringIO()
+
+        def dispatch():
+            if self.libvirt.virEventRunDefaultImpl.call_count == 1:
+                autoreclaim.signal.raise_signal(autoreclaim.signal.SIGUSR2)
+                self.assertEqual(logger.level, autoreclaim.logging.INFO)
+                return 0
+            if self.libvirt.virEventRunDefaultImpl.call_count == 2:
+                self.assertEqual(logger.level, autoreclaim.logging.DEBUG)
+                self.assertTrue(logger.isEnabledFor(autoreclaim.logging.DEBUG))
+                autoreclaim.signal.raise_signal(autoreclaim.signal.SIGUSR2)
+                autoreclaim.signal.raise_signal(autoreclaim.signal.SIGUSR1)
+                return 0
+            self.assertEqual(logger.level, autoreclaim.logging.INFO)
+            self.assertFalse(logger.isEnabledFor(autoreclaim.logging.DEBUG))
+            self.assertIn("Cached status", output.getvalue())
+            raise KeyboardInterrupt
+
+        self.libvirt.virEventRunDefaultImpl.side_effect = dispatch
+        with patch.object(autoreclaim.logging, "info") as info, redirect_stdout(output):
+            with self.assertRaises(KeyboardInterrupt):
+                self.controller.daemon()
+        self.assertIn((("Debug logging %s", "enabled"),), info.call_args_list)
+        self.assertIn((("Debug logging %s", "disabled"),), info.call_args_list)
+        self.assertIs(autoreclaim.signal.getsignal(autoreclaim.signal.SIGUSR2), old_handler)
+        self.conn.listDomainsID.assert_not_called()
+
+    def test_sigusr2_processes_each_pending_toggle_with_debug_initially_enabled(self):
+        logger = autoreclaim.logging.getLogger()
+        self.addCleanup(logger.setLevel, logger.level)
+        logger.setLevel(autoreclaim.logging.DEBUG)
+        with patch.object(autoreclaim.logging, "info") as info:
+            request = self.controller._LibVirtAutoReclaim__request_debug_toggle
+            process = self.controller._LibVirtAutoReclaim__process_signal_requests
+            request(autoreclaim.signal.SIGUSR2, None)
+            process()
+            self.assertEqual(logger.level, autoreclaim.logging.INFO)
+            request(autoreclaim.signal.SIGUSR2, None)
+            request(autoreclaim.signal.SIGUSR2, None)
+            process()
+            self.assertEqual(logger.level, autoreclaim.logging.INFO)
+        self.assertEqual([call.args[1] for call in info.call_args_list],
+                         ["disabled", "enabled", "disabled"])
+
+    def test_sigusr2_toggles_debug_during_reconnect_backoff(self):
+        read_fd, write_fd = autoreclaim.os.pipe2(autoreclaim.os.O_NONBLOCK | autoreclaim.os.O_CLOEXEC)
+        logger = autoreclaim.logging.getLogger()
+        self.addCleanup(logger.setLevel, logger.level)
+        logger.setLevel(autoreclaim.logging.INFO)
+        try:
+            def receive_signal(*_args):
+                autoreclaim.os.write(write_fd, b"x")
+                self.controller._LibVirtAutoReclaim__request_debug_toggle(autoreclaim.signal.SIGUSR2, None)
+                return [read_fd], [], []
+
+            with patch.object(autoreclaim, "monotonic", side_effect=[100, 100, 101]), \
+                    patch.object(autoreclaim.select, "select", side_effect=receive_signal), \
+                    patch.object(autoreclaim.logging, "info"):
+                self.controller._LibVirtAutoReclaim__wait_reconnect(read_fd, 1)
+                self.assertEqual(logger.level, autoreclaim.logging.DEBUG)
+        finally:
+            autoreclaim.os.close(read_fd)
+            autoreclaim.os.close(write_fd)
+
+    def test_failed_signal_watch_restores_signal_handler(self):
+        old_handler = autoreclaim.signal.getsignal(autoreclaim.signal.SIGUSR1)
+        old_debug_handler = autoreclaim.signal.getsignal(autoreclaim.signal.SIGUSR2)
+        self.libvirt.virEventAddHandle.return_value = -1
+        with self.assertRaisesRegex(autoreclaim.ExitFailure, "signal wakeup"):
+            self.controller.daemon()
+        self.assertIs(autoreclaim.signal.getsignal(autoreclaim.signal.SIGUSR1), old_handler)
+        self.assertIs(autoreclaim.signal.getsignal(autoreclaim.signal.SIGUSR2), old_debug_handler)
+        self.libvirt.virEventRemoveHandle.assert_not_called()
+
     def test_daemon_registers_and_removes_virtio_mem_callback_when_supported(self):
         self.libvirt.VIR_DOMAIN_EVENT_ID_MEMORY_DEVICE_SIZE_CHANGE = 9
         self.conn.domainEventRegisterAny.side_effect = [3, 4]
@@ -3242,13 +3052,14 @@ class LifecycleTests(unittest.TestCase):
         self.conn.close.side_effect = self.libvirt.libvirtError("close failed")
 
         with patch.object(autoreclaim, "LibVirtAutoReclaim", return_value=self.controller):
-            with patch.object(autoreclaim, "sleep", side_effect=KeyboardInterrupt) as sleep:
+            with patch.object(self.controller, "_LibVirtAutoReclaim__wait_reconnect",
+                              side_effect=KeyboardInterrupt) as wait_reconnect:
                 with self.assertRaises(SystemExit) as stopped:
-                    autoreclaim.libvirt_autoreclaim(["libvirt-autoreclaim", "start"])
+                    autoreclaim.libvirt_autoreclaim(["libvirt-autoreclaim"])
 
         self.assertEqual(stopped.exception.code, 130)
         self.assertTrue(stopped.exception.__suppress_context__)
-        sleep.assert_called_once_with(1)
+        self.assertEqual(wait_reconnect.call_args.args[1], 1)
         self.libvirt.virEventRemoveTimeout.assert_called_once_with(7)
         self.assertIsNone(self.controller.timer_id)
         self.assertEqual([call.args for call in self.conn.domainEventDeregisterAny.call_args_list],
@@ -3266,11 +3077,11 @@ class LifecycleTests(unittest.TestCase):
         self.libvirt.open.side_effect = [None, self.libvirt.libvirtError("refused"), new_conn]
         self.libvirt.virEventRunDefaultImpl.side_effect = KeyboardInterrupt
 
-        with patch.object(autoreclaim, "sleep") as sleep:
+        with patch.object(self.controller, "_LibVirtAutoReclaim__wait_reconnect") as wait_reconnect:
             with self.assertRaises(KeyboardInterrupt):
                 self.controller.daemon()
 
-        self.assertEqual([call.args for call in sleep.call_args_list], [(1,), (2,), (4,)])
+        self.assertEqual([call.args[1] for call in wait_reconnect.call_args_list], [1, 2, 4])
         self.assertEqual(self.libvirt.open.call_count, 4)
         self.libvirt.open.assert_called_with("qemu:///system")
         self.conn.close.assert_called_once_with()
@@ -3285,7 +3096,7 @@ class LifecycleTests(unittest.TestCase):
         with patch.object(autoreclaim, "LibVirtAutoReclaim", return_value=self.controller):
             with patch.object(self.controller, "daemon", side_effect=autoreclaim.ExitFailure):
                 with self.assertRaises(autoreclaim.ExitFailure):
-                    autoreclaim.libvirt_autoreclaim(["libvirt-autoreclaim", "start"])
+                    autoreclaim.libvirt_autoreclaim(["libvirt-autoreclaim"])
         self.conn.close.assert_called_once_with()
 
     def test_sigterm_removes_timer_deregisters_events_and_closes_connection(self):
@@ -3297,9 +3108,9 @@ class LifecycleTests(unittest.TestCase):
                 self.libvirt.virEventRunDefaultImpl.side_effect = lambda: (
                     signals.call_args_list[0].args[1](autoreclaim.signal.SIGTERM, None))
                 with self.assertRaises(SystemExit) as stopped:
-                    autoreclaim.libvirt_autoreclaim(["libvirt-autoreclaim", "start"])
+                    autoreclaim.libvirt_autoreclaim(["libvirt-autoreclaim"])
                 self.assertEqual(stopped.exception.code, 143)
-                self.assertEqual(signals.call_count, 2)
+                self.assertEqual(signals.call_count, 6)
                 signals.assert_called_with(autoreclaim.signal.SIGTERM, previous_handler)
         self.libvirt.virEventRemoveTimeout.assert_called_once_with(7)
         self.conn.domainEventDeregisterAny.assert_called_once_with(3)
